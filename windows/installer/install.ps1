@@ -197,8 +197,9 @@ if (Test-Path $VENV_DIR) {
     Write-Success "Virtual environment created."
 }
 
-$pipExe    = Join-Path $VENV_DIR "Scripts\pip.exe"
-$pythonExe = Join-Path $VENV_DIR "Scripts\python.exe"
+$pipExe     = Join-Path $VENV_DIR "Scripts\pip.exe"
+$pythonExe  = Join-Path $VENV_DIR "Scripts\python.exe"   # used for pip / venv ops
+$pythonwExe = Join-Path $VENV_DIR "Scripts\pythonw.exe"  # used to launch the app (no console)
 
 # Upgrade pip silently
 & $pythonExe -m pip install --upgrade pip --quiet 2>$null | Out-Null
@@ -283,11 +284,11 @@ foreach ($dir in $shortcutDirs) {
         if (-not (Test-Path $shortcutPath)) {
             $ws  = New-Object -ComObject WScript.Shell
             $lnk = $ws.CreateShortcut($shortcutPath)
-            $lnk.TargetPath       = $pythonExe
+            $lnk.TargetPath       = $pythonwExe
             $lnk.Arguments        = "-m src.main"
             $lnk.WorkingDirectory = $INSTALL_DIR
             $lnk.Description      = "Xbox Controller Bluetooth Bridge"
-            $lnk.WindowStyle      = 1
+            $lnk.WindowStyle      = 7  # Minimised, no flash
             $lnk.IconLocation     = "$env:SystemRoot\System32\shell32.dll,19"
             $lnk.Save()
         }
@@ -308,11 +309,10 @@ $env:LISTEN_PORT = "$LISTEN_PORT"
 $env:LOG_LEVEL   = "INFO"
 
 $proc = Start-Process `
-    -FilePath $pythonExe `
+    -FilePath $pythonwExe `
     -ArgumentList "-m src.main" `
     -WorkingDirectory $INSTALL_DIR `
-    -PassThru `
-    -WindowStyle Minimized
+    -PassThru
 
 Start-Sleep 3
 

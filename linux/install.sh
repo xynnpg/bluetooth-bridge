@@ -124,9 +124,7 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 COPY src/ /app/src/
 WORKDIR /app
 
-# Discovery broadcast — send once on container start so Linux can find Windows
-CMD ["sh", "-c", \
-     "python -m src.main & sleep 2 && python -c \"import socket; s=socket.socket(2,2); s.setsockopt(1,10,1); s.sendto(b'BRIDGE_HELLO:$(hostname -I | awk '{print $1}'):9999',('<broadcast>',9876)); s.close()\" & wait"]
+CMD ["python", "-m", "src.main"]
 DOCKERFILE
 
 # docker-compose.yml
@@ -293,45 +291,71 @@ else
     exit 1
 fi
 
-# ── 11. Auto-start with systemd (user service) ────────────────────────────────
 
-install_systemd_service() {
-    info "Setting up systemd user service …"
-    mkdir -p "$HOME/.config/systemd/user/"
+# ── 11. Auto-start with systemd ───────────────────────────────────────────────
 
-    cat > "$HOME/.config/systemd/user/xbox-bridge.service" <<EOF
+DOCKER_BIN=$(command -v docker)
+COMPOSE_CMD="$DOCKER_BIN compose"
+
+if command -v systemctl &>/dev/null; then
+    if [[ $EUID -eq 0 ]]; then
+        # Running as root → install a system service
+        info "Setting up systemd system service (running as root) …"
+        cat > /etc/systemd/system/xbox-bridge.service <<EOF
 [Unit]
 Description=Xbox Controller Bluetooth Bridge
-After=network-online.target
+After=network-online.target docker.service
 Wants=network-online.target
+Requires=docker.service
 
 [Service]
+Type=simple
 Restart=always
 RestartSec=5
 WorkingDirectory=$INSTALL_DIR
-ExecStart=/usr/bin/docker compose -f $INSTALL_DIR/docker-compose.yml up
-ExecStop=/usr/bin/docker compose -f $INSTALL_DIR/docker-compose.yml down
+ExecStart=$COMPOSE_CMD -f $INSTALL_DIR/docker-compose.yml up
+ExecStop=$COMPOSE_CMD -f $INSTALL_DIR/docker-compose.yml down
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable xbox-bridge
+        systemctl start  xbox-bridge
+        success "systemd system service enabled and started."
+    else
+        # Running as normal user → install a user service
+        info "Setting up systemd user service …"
+        sudo loginctl enable-linger "$USER" &>/dev/null || true
+        mkdir -p "$HOME/.config/systemd/user/"
+        cat > "$HOME/.config/systemd/user/xbox-bridge.service" <<EOF
+[Unit]
+Description=Xbox Controller Bluetooth Bridge
+After=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$COMPOSE_CMD -f $INSTALL_DIR/docker-compose.yml up
+ExecStop=$COMPOSE_CMD -f $INSTALL_DIR/docker-compose.yml down
 
 [Install]
 WantedBy=default.target
 EOF
-
-    systemctl --user daemon-reload
-    systemctl --user enable xbox-bridge
-    systemctl --user start xbox-bridge
-    success "systemd service: enabled and started."
-}
-
-if command -v systemctl &>/dev/null; then
-    sudo loginctl enable-linger "$USER" &>/dev/null || true
-    if install_systemd_service 2>&1; then
-        :
-    else
-        warn "Could not install systemd service (may need loginctl)."
+        systemctl --user daemon-reload
+        systemctl --user enable xbox-bridge
+        systemctl --user start  xbox-bridge
+        success "systemd user service enabled and started."
     fi
 else
     info "systemd not available — container will not auto-start on reboot."
 fi
+
+
 
 # ── Done ───────────────────────────────────────────────────────────────────────
 
@@ -346,8 +370,8 @@ success "Windows target:   $PC_HOST:$EXTERNAL_PORT"
 echo ""
 echo -e "${YELLOW}  On your Windows PC, make sure the app is running, then play!${RESET}"
 echo ""
-echo "  Check status:   docker logs -f xbox-bridge"
-echo "  Restart:        cd $INSTALL_DIR && docker compose restart"
-echo "  Uninstall:      docker compose -f $INSTALL_DIR/docker-compose.yml down"
+echo "  Check status:   $DOCKER logs -f xbox-bridge"
+echo "  Restart:        cd $INSTALL_DIR && $DOCKER compose restart"
+echo "  Uninstall:      $DOCKER compose -f $INSTALL_DIR/docker-compose.yml down"
 echo "                  rm -rf $INSTALL_DIR"
 echo ""

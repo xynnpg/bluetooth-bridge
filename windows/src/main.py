@@ -21,6 +21,17 @@ import sys
 import threading
 import time
 
+# Hide the console window as soon as possible so the app runs silently in the
+# system tray.  This works even when launched with python.exe (not pythonw.exe).
+if sys.platform == "win32":
+    try:
+        import ctypes
+        _hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if _hwnd:
+            ctypes.windll.user32.ShowWindow(_hwnd, 0)  # SW_HIDE
+    except Exception:
+        pass
+
 from .receiver import TCPReceiver
 from .emitter  import XInputEmitter
 from .tray     import TrayManager

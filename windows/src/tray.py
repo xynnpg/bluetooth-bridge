@@ -87,8 +87,8 @@ class TrayManager:
     def _build_menu(self):
         # Lazy imports so tray still works without tkinter
         return pystray.Menu(
-            pystray.MenuItem("Xbox Bridge", enabled=False),
-            pystray.MenuItem(lambda _, __: self._status_label, enabled=False),
+            pystray.MenuItem("Xbox Bridge", None, enabled=False),
+            pystray.MenuItem(lambda _, __: self._status_label, None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("View Logs…", self._handle_view_logs),
             pystray.MenuItem("Copy Logs", self._handle_copy_logs),
