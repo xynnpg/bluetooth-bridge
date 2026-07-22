@@ -51,6 +51,22 @@ if ! command -v docker &>/dev/null; then
 fi
 success "Docker: $(docker --version | cut -d' ' -f3)"
 
+# Work out whether we need to prefix docker commands with sudo.
+# Order of preference: already root → plain docker → sudo docker
+if docker info &>/dev/null 2>&1; then
+    DOCKER="docker"
+elif sudo -n docker info &>/dev/null 2>&1; then
+    DOCKER="sudo docker"
+    warn "Docker requires sudo — using 'sudo docker' for all Docker commands."
+else
+    err "Cannot reach the Docker daemon as this user."
+    info "Fix option A (recommended): add yourself to the docker group and log out/in:"
+    info "  sudo usermod -aG docker \$USER && newgrp docker"
+    info "Fix option B: run the installer as root:"
+    info "  curl -fsSL <url> > /tmp/install.sh && sudo bash /tmp/install.sh $1"
+    exit 1
+fi
+
 if ! command -v curl &>/dev/null; then
     err "curl is not installed."
     exit 1
@@ -95,7 +111,7 @@ info "Generating configuration …"
 
 # Dockerfile
 cat > "$INSTALL_DIR/Dockerfile" <<'DOCKERFILE'
-FROM python:3.14-slim
+FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bluez dbus linux-libc-dev build-essential python3-dev \
@@ -238,31 +254,42 @@ fi
 info "Building Docker image (first run may take ~2 minutes) …"
 cd "$INSTALL_DIR"
 
-if docker build -t xbox-bridge . --quiet 2>&1 | tail -5; then
-    success "Docker image built."
-else
-    err "Docker build failed. Check the output above."
+BUILD_OK=false
+for attempt in 1 2 3; do
+    if $DOCKER build -t xbox-bridge . 2>&1; then
+        BUILD_OK=true
+        break
+    fi
+    if [[ $attempt -lt 3 ]]; then
+        warn "Build attempt $attempt failed — retrying in 10 s …"
+        sleep 10
+    fi
+done
+
+if [[ "$BUILD_OK" != true ]]; then
+    err "Docker build failed after 3 attempts. Check the output above."
     exit 1
 fi
+success "Docker image built."
 
 # ── 9. Stop existing container ────────────────────────────────────────────────
 
 info "Stopping any existing container …"
-docker compose -f "$INSTALL_DIR/docker-compose.yml" down &>/dev/null || true
+$DOCKER compose -f "$INSTALL_DIR/docker-compose.yml" down &>/dev/null || true
 
 # ── 10. Start container ───────────────────────────────────────────────────────
 
 info "Starting container in background …"
-docker compose -f "$INSTALL_DIR/docker-compose.yml" up -d
+$DOCKER compose -f "$INSTALL_DIR/docker-compose.yml" up -d
 
 sleep 3
 
-if docker ps --filter "name=xbox-bridge" --format "{{.Names}}" | grep -q xbox-bridge; then
+if $DOCKER ps --filter "name=xbox-bridge" --format "{{.Names}}" | grep -q xbox-bridge; then
     success "Container 'xbox-bridge' is running."
-    docker logs --tail 10 xbox-bridge
+    $DOCKER logs --tail 10 xbox-bridge
 else
     err "Container failed to start. Check:"
-    err "  docker logs -f xbox-bridge"
+    err "  $DOCKER logs -f xbox-bridge"
     exit 1
 fi
 

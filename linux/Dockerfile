@@ -1,4 +1,4 @@
-FROM python:3.14-slim
+FROM python:3.12-slim
 
 # Install Bluetooth, DBus, kernel headers, and C compiler (needed to build python-evdev)
 RUN apt-get update && apt-get install -y --no-install-recommends \
