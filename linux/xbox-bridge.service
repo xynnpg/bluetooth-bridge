@@ -1,0 +1,37 @@
+# Xbox Controller Bluetooth Bridge
+# systemd service for the Linux Docker container
+
+[Unit]
+Description=Xbox Controller Bluetooth Bridge
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+# Restart on crash but not on normal stop
+Restart=unless-stopped
+RestartSec=5
+
+# Start docker compose in the project directory
+ExecStartPre=-/usr/bin/flock /run/xbox-bridge.lock /usr/bin/docker compose -f /home/xynnpg/Projects/bluetooth-bridge/linux/docker-compose.yml down
+ExecStart=/usr/bin/docker compose -f /home/xynnpg/Projects/bluetooth-bridge/linux/docker-compose.yml up
+ExecStop=/usr/bin/docker compose -f /home/xynnpg/Projects/bluetooth-bridge/linux/docker-compose.yml down
+
+# Keep the lock file dir
+RuntimeDirectory=xbox-bridge
+
+# Grant docker access to dbus / bluetooth sockets at runtime
+# The container is --privileged and --network host; if you prefer no --privileged,
+# add these binds at the *host* level:
+# BindReadOnlyPaths=/var/run/dbus:/var/run/dbus:ro
+# BindReadOnlyPaths=/run/dbus:/run/dbus:ro
+# BindReadOnlyPaths=/dev/input:/dev/input:ro
+
+# Environment (override in /etc/default/xbox-bridge or .env next to docker-compose.yml)
+EnvironmentFile=-/home/xynnpg/Projects/bluetooth-bridge/linux/.env
+
+# Disable logging to journal (container logs go to docker logs)
+StdRedirect=null
+
+[Install]
+WantedBy=multi-user.target

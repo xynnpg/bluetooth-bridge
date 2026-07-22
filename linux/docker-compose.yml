@@ -1,0 +1,17 @@
+services:
+  xbox-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: xbox-bridge
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    volumes:
+      - /var/run/dbus:/var/run/dbus:ro
+      - /run/dbus:/run/dbus:ro
+      - /dev/input:/dev/input:ro
+    environment:
+      - PC_HOST=${PC_HOST:-auto}   # Use 'auto' for zero-config discovery, or set an IP manually
+      - PC_PORT=${PC_PORT:-9999}
+      - CONTROLLER_MAC=${CONTROLLER_MAC}
