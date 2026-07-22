@@ -48,21 +48,12 @@ class StateParser:
 class TCPReceiver:
     """TCP server that dispatches parsed state to a callback."""
 
-    def __init__(self, host: str, port: int, on_state):
-        """
-        Parameters
-        ----------
-        host : str
-            Bind address. Use "" or "0.0.0.0" to accept from any interface.
-        port : int
-            TCP port (must match the Linux side PC_PORT).
-        on_state : Callable[[dict], None]
-            Called with the parsed state dict for each received packet.
-        """
-        self.bind_host = host
-        self.port = port
-        self.on_state = on_state
-        self._running = False
+    def __init__(self, host: str, port: int, on_state, on_connect=None):
+        self.bind_host  = host
+        self.port       = port
+        self.on_state   = on_state
+        self.on_connect = on_connect   # optional: called with (ip: str) on new connection
+        self._running   = False
         self._thread: threading.Thread | None = None
         self._listener: socket.socket | None = None
 
@@ -107,6 +98,11 @@ class TCPReceiver:
                 self._listener.settimeout(2.0)
                 conn, addr = self._listener.accept()
                 logger.info("Connection from %s", addr[0])
+                if self.on_connect:
+                    try:
+                        self.on_connect(addr[0])
+                    except Exception:
+                        pass
                 threading.Thread(
                     target=self._serve,
                     args=(conn, addr),

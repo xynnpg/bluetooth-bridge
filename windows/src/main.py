@@ -45,9 +45,9 @@ LOG_DIR  = os.path.join(
     os.environ.get("LOCALAPPDATA", os.environ.get("USERPROFILE", ".")),
     "bluetooth_bridge"
 )
-LOG_FILE = os.path.join(LOG_DIR, "bluetooth-bridge.log")
-
-INSTALL_DIR = os.path.join(os.environ.get("USERPROFILE", "."), "bluetooth_bridge")
+LOG_FILE    = os.path.join(LOG_DIR, "bluetooth-bridge.log")
+INSTALL_DIR = os.path.abspath(os.getcwd())   # wherever the app is installed
+CONFIG_FILE = os.path.join(INSTALL_DIR, "config.ini")
 
 
 def _configure_logging() -> None:
@@ -125,11 +125,15 @@ class BridgeApp:
         # Pass context to tray
         self._tray.set_log_path(LOG_FILE)
         self._tray.set_install_dir(INSTALL_DIR)
+        self._tray.set_config_path(CONFIG_FILE)
         self._tray.set_listen_addr(f"{listener_host}:{listener_port}")
 
         # Start TCP receiver
-        self._receiver = TCPReceiver(listener_host, listener_port,
-                                     on_state=self._on_state)
+        self._receiver = TCPReceiver(
+            listener_host, listener_port,
+            on_state=self._on_state,
+            on_connect=self._on_connect,
+        )
         self._receiver.start()
 
         # Connection monitor runs in the background
@@ -154,6 +158,13 @@ class BridgeApp:
     # ------------------------------------------------------------------
     # Callbacks
     # ------------------------------------------------------------------
+
+    def _on_connect(self, peer_ip: str) -> None:
+        """Called when the Linux bridge opens a TCP connection."""
+        logger.info("Linux bridge connected from %s", peer_ip)
+        self._peer_ip = peer_ip
+        self._pc_reachable = True
+        self._tray.update(connected=True, pc_reachable=True, peer_ip=peer_ip)
 
     def _on_state(self, state: dict) -> None:
         """Called for every received controller state packet."""

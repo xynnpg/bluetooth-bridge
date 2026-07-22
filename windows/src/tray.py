@@ -18,6 +18,12 @@ except ImportError:
     pystray = None  # type: ignore
     Image = None    # type: ignore
 
+try:
+    from . import ui as _ui
+    _UI_AVAILABLE = True
+except Exception:
+    _UI_AVAILABLE = False
+
 logger = logging.getLogger("tray")
 
 VERSION = "1.0.0"
@@ -90,6 +96,7 @@ class TrayManager:
         self._status_text  = "Starting…"
         self._listen_addr  = ""
         self._install_dir  = ""
+        self._config_path  = ""
         self._log_path: str | None = None
         self._connected    = False
         self._peer_ip      = ""
@@ -106,6 +113,9 @@ class TrayManager:
 
     def set_install_dir(self, path: str) -> None:
         self._install_dir = path
+
+    def set_config_path(self, path: str) -> None:
+        self._config_path = path
 
     # ------------------------------------------------------------------
     # Main-thread entry point (replaces start() + thread)
@@ -237,15 +247,16 @@ class TrayManager:
 
     def _handle_view_logs(self, _=None) -> None:
         path = self._log_path
-        if not path or not os.path.exists(path):
-            self._notify("Log file not found.", title="Xbox Bridge")
+        if not path:
+            self._notify("Log path not configured.", title="Xbox Bridge")
             return
-        try:
-            os.startfile(path)  # type: ignore[attr-defined]
-        except AttributeError:
-            subprocess.Popen(["notepad", path])
-        except Exception as exc:
-            logger.error("Cannot open log file: %s", exc)
+        if _UI_AVAILABLE:
+            _ui.open_log_viewer(path)
+        else:
+            try:
+                os.startfile(path)  # type: ignore[attr-defined]
+            except Exception:
+                subprocess.Popen(["notepad", path])
 
     def _handle_copy_logs(self, _=None) -> None:
         path = self._log_path
@@ -304,21 +315,29 @@ class TrayManager:
                 logger.error("Reconnect error: %s", exc)
 
     def _handle_settings(self, _=None) -> None:
-        config_candidates = [
-            os.path.join(self._install_dir, "config.ini"),
-            os.path.join(
+        config = self._config_path
+        if not config:
+            config = os.path.join(
                 os.environ.get("USERPROFILE", "."),
                 "bluetooth_bridge", "config.ini"
-            ),
-        ]
-        config = next((p for p in config_candidates if os.path.exists(p)), None)
-        if not config:
-            self._notify("config.ini not found.", title="Xbox Bridge")
-            return
-        try:
-            os.startfile(config)  # type: ignore[attr-defined]
-        except Exception as exc:
-            subprocess.Popen(["notepad", config])
+            )
+        if _UI_AVAILABLE:
+            _ui.open_settings(config, on_log_level_change=self._on_log_level_change)
+        else:
+            # Fallback to notepad
+            if os.path.exists(config):
+                try:
+                    os.startfile(config)  # type: ignore[attr-defined]
+                except Exception:
+                    subprocess.Popen(["notepad", config])
+            else:
+                self._notify("config.ini not found.", title="Xbox Bridge")
+
+    def _on_log_level_change(self, level: str) -> None:
+        """Called by the settings window when the user saves a new log level."""
+        import logging as _logging
+        _logging.getLogger().setLevel(getattr(_logging, level, _logging.INFO))
+        logger.info("Log level changed to %s", level)
 
     def _handle_about(self, _=None) -> None:
         lines = [
