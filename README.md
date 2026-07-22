@@ -12,17 +12,17 @@ Stream your Bluetooth Xbox controller from a Linux server (or any Linux machine)
  Linux Server                           Windows PC
 ──────────────                          ───────────
 ┌──────────────────┐                   ┌──────────────────┐
-│  Docker          │  TCP 24-byte pkts  │  Tray App        │
+│  Docker          │  TCP 24-byte pkts │  Tray App        │
 │  container       │ ─────────────────►│  Receives state  │
-│                  │   ~60 Hz           │        ↓         │
+│                  │   ~60 Hz          │        ↓         │
 │  evdev reads     │  127.0.0.1:9999   │  ViGEmBus        │
-│  BT controller   │                    │  (vgamepad)      │
+│  BT controller   │                   │  (vgamepad)      │
 │                  │ ◄── UDP broadcast │        ↓         │
-│  bluetoothctl    │    port 9876       │  Virtual Xbox    │
-│                  │    (auto-find IP)  │  controller      │
-└──────────────────┘                    └──────────────────┘
-  systemd service                         Start Menu shortcut
-  (auto-starts on boot)                   System tray
+│  bluetoothctl    │    port 9876      │  Virtual Xbox    │
+│                  │    (auto-find IP) │  controller      │
+└──────────────────┘                   └──────────────────┘
+  systemd service                        Start Menu shortcut
+  (auto-starts on boot)                  System tray
 ```
 
 Auto-discovery means you don't type IPs anywhere — Windows announces itself and Linux finds it automatically.

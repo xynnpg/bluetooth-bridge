@@ -198,8 +198,14 @@ if (Test-Path $VENV_DIR) {
 }
 
 $pipExe     = Join-Path $VENV_DIR "Scripts\pip.exe"
-$pythonExe  = Join-Path $VENV_DIR "Scripts\python.exe"   # used for pip / venv ops
-$pythonwExe = Join-Path $VENV_DIR "Scripts\pythonw.exe"  # used to launch the app (no console)
+$pythonExe  = Join-Path $VENV_DIR "Scripts\python.exe"    # pip / venv ops
+$pythonwExe = Join-Path $VENV_DIR "Scripts\pythonw.exe"   # no-console launcher
+
+# pythonw.exe may be absent in minimal Python installs; fall back gracefully
+if (-not (Test-Path $pythonwExe)) {
+    Write-Warn "pythonw.exe not found — using python.exe (console will be hidden by the app itself)"
+    $pythonwExe = $pythonExe
+}
 
 # Upgrade pip silently
 & $pythonExe -m pip install --upgrade pip --quiet 2>$null | Out-Null

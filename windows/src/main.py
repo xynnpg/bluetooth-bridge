@@ -1,7 +1,7 @@
 """Xbox Controller Bluetooth Bridge — Windows side entry point.
 
-Receives 24-byte state packets from the Linux bridge over TCP and emits a
-virtual Xbox controller via ViGEmBus (vgamepad).
+Receives state packets from the Linux bridge over TCP and emits a virtual
+Xbox controller via ViGEmBus (vgamepad).
 
 Install ViGEmBus first: https://github.com/ViGEm/ViGEmBus/releases
 
@@ -21,104 +21,134 @@ import sys
 import threading
 import time
 
-# Hide the console window as soon as possible so the app runs silently in the
-# system tray.  This works even when launched with python.exe (not pythonw.exe).
+# ── Hide console window (works with both python.exe and pythonw.exe) ────────
+# With pythonw.exe there is no console so GetConsoleWindow returns 0 (safe).
+# With python.exe this removes the flash before the tray appears.
 if sys.platform == "win32":
     try:
-        import ctypes
-        _hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        import ctypes as _ctypes
+        _hwnd = _ctypes.windll.kernel32.GetConsoleWindow()
         if _hwnd:
-            ctypes.windll.user32.ShowWindow(_hwnd, 0)  # SW_HIDE
+            _ctypes.windll.user32.ShowWindow(_hwnd, 0)  # SW_HIDE
     except Exception:
         pass
 
-from .receiver import TCPReceiver
-from .emitter  import XInputEmitter
-from .tray     import TrayManager
+from .receiver  import TCPReceiver
+from .emitter   import XInputEmitter
+from .tray      import TrayManager
 from .discovery import DiscoveryBroadcaster
 
 logger = logging.getLogger("main")
 
-# Rotating log file — keeps 5 × 5 MB files = ~25 MB total
-LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.environ.get("USERPROFILE", ".")), "bluetooth_bridge")
+# Rotating log — 5 × 5 MB = ~25 MB total
+LOG_DIR  = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.environ.get("USERPROFILE", ".")),
+    "bluetooth_bridge"
+)
 LOG_FILE = os.path.join(LOG_DIR, "bluetooth-bridge.log")
+
+INSTALL_DIR = os.path.join(os.environ.get("USERPROFILE", "."), "bluetooth_bridge")
+
 
 def _configure_logging() -> None:
     os.makedirs(LOG_DIR, exist_ok=True)
+
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
-    # Clean handlers from basicConfig if any
+    # Remove any handlers added by earlier basicConfig calls
     for h in root.handlers[:]:
         root.removeHandler(h)
 
-    # File handler — rotate every 5 MB
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                            datefmt="%H:%M:%S")
+
+    # Rotating file handler — always active
     fh = logging.handlers.RotatingFileHandler(
         LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
     fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    ))
-
-    # Console handler
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-
+    fh.setFormatter(fmt)
     root.addHandler(fh)
-    root.addHandler(ch)
 
+    # Console handler — only when stdout is available (python.exe, not pythonw.exe)
+    if sys.stdout is not None:
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(fmt)
+        root.addHandler(ch)
+
+
+# ---------------------------------------------------------------------------
+# Bridge application
+# ---------------------------------------------------------------------------
 
 class BridgeApp:
-    def __init__(self):
+    def __init__(self) -> None:
         self._running       = False
-        self._receiver      = None
+        self._receiver: TCPReceiver | None = None
         self._emitter       = XInputEmitter(slot=0)
         self._tray          = TrayManager(
             on_exit=self.stop,
             on_restart_controller=self._restart_controller,
             on_reconnect=self._reconnect,
         )
-        self._broadcaster  = DiscoveryBroadcaster()
-        # Track connection status for tray
-        self._controller_ok    = False
-        self._pc_reachable     = False
+        self._broadcaster   = DiscoveryBroadcaster()
+
+        self._controller_ok = False
+        self._pc_reachable  = False
+        self._peer_ip       = ""
+        self._last_recv     = time.monotonic()
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def run(self) -> None:
+        """Start the bridge and block on the tray message loop (main thread)."""
         self._running = True
 
         listener_host = os.environ.get("LISTEN_HOST", "0.0.0.0")
         listener_port = int(os.environ.get("LISTEN_PORT", "9999"))
 
-        logger.info("Starting Xbox Bridge (Windows) — listening on %s:%s", listener_host, listener_port)
+        logger.info("Starting Xbox Bridge (Windows) — listening on %s:%s",
+                    listener_host, listener_port)
 
-        # Attach ViGEmBus controller
+        # Attach ViGEmBus virtual controller
         if not self._emitter.attach():
-            logger.error("Could not attach ViGEmBus controller. Is ViGEmBus installed?")
+            logger.error("Could not attach ViGEmBus controller — is ViGEmBus installed?")
             sys.exit(1)
 
         self._broadcaster.start()
         atexit.register(self._cleanup)
 
-        # Wire log path into tray
+        # Pass context to tray
         self._tray.set_log_path(LOG_FILE)
+        self._tray.set_install_dir(INSTALL_DIR)
+        self._tray.set_listen_addr(f"{listener_host}:{listener_port}")
 
-        # Start TCP receiver + tray
-        self._receiver = TCPReceiver(listener_host, listener_port, on_state=self._on_state)
+        # Start TCP receiver
+        self._receiver = TCPReceiver(listener_host, listener_port,
+                                     on_state=self._on_state)
         self._receiver.start()
-        self._tray.start()
 
-        logger.info("Bridge running. Press the Exit tray item to stop.")
-        self._wait_until_stopped()
+        # Connection monitor runs in the background
+        monitor = threading.Thread(
+            target=self._monitor_loop, name="Monitor", daemon=True
+        )
+        monitor.start()
+
+        logger.info("Bridge running — icon in the system notification area")
+
+        # ── Tray icon runs on the main thread (required for Win32 msg loop) ──
+        self._tray.run_blocking()
+
+        # run_blocking() returned → user clicked Exit
+        logger.info("Tray exited — shutting down")
 
     def stop(self) -> None:
-        """Signal the app to shut down. Thread-safe."""
-        logger.info("Received stop signal")
+        """Signal the app to shut down (thread-safe)."""
+        logger.info("Stop signal received")
         self._running = False
 
     # ------------------------------------------------------------------
@@ -126,48 +156,44 @@ class BridgeApp:
     # ------------------------------------------------------------------
 
     def _on_state(self, state: dict) -> None:
-        """Called on each received controller state packet."""
-        # First packet means the PC connection is healthy
+        """Called for every received controller state packet."""
         if not self._pc_reachable:
             self._pc_reachable = True
             logger.info("Linux bridge connected")
-            self._tray.update(connected=True, pc_reachable=True)
+            self._tray.update(connected=True, pc_reachable=True,
+                              peer_ip=self._peer_ip)
 
         self._controller_ok = True
+        self._last_recv     = time.monotonic()
+
         try:
             self._emitter.apply(state)
         except Exception as exc:
             logger.error("Emitter error: %s", exc)
 
-        # Monitor: if we stop receiving for > 3 s, mark PC down
-        self._last_recv = time.monotonic()
-
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
-    def _wait_until_stopped(self) -> None:
-        last_recv = time.monotonic()
-
+    def _monitor_loop(self) -> None:
+        """Periodically check connection health and update the tray icon."""
         while self._running:
             time.sleep(0.5)
 
-            # Check if PC connection is stale
             if self._pc_reachable:
-                elapsed = time.monotonic() - last_recv
+                elapsed = time.monotonic() - self._last_recv
                 if elapsed > 3.0 and not self._controller_ok:
-                    # timeout — no new state for several seconds
                     self._pc_reachable = False
-                    logger.warning("Connection to Linux bridge lost (no data for %.1f s)", elapsed)
+                    logger.warning("Linux bridge gone (%.1f s silence)", elapsed)
 
+            # Reset per-cycle flag
             self._controller_ok = False
 
-            # Refresh tray status
             self._tray.update(
-                connected=self._controller_ok or self._pc_reachable,
+                connected=self._pc_reachable,
                 pc_reachable=self._pc_reachable,
+                peer_ip=self._peer_ip,
             )
-            last_recv = time.monotonic()
 
     def _cleanup(self) -> None:
         logger.info("Cleaning up …")
@@ -185,7 +211,6 @@ class BridgeApp:
     # ------------------------------------------------------------------
 
     def _restart_controller(self) -> None:
-        """Detach and re-attach the virtual controller (called from tray)."""
         logger.info("Restarting virtual controller …")
         try:
             self._emitter.detach()
@@ -194,27 +219,28 @@ class BridgeApp:
             self._emitter.attach()
             logger.info("Virtual controller restarted")
         except Exception as exc:
-            logger.error("Failed to restart controller: %s", exc)
+            logger.error("Restart controller error: %s", exc)
 
     def _reconnect(self) -> None:
-        """Restart the TCP receiver (called from tray)."""
         logger.info("Reconnecting TCP receiver …")
         try:
             if self._receiver:
                 self._receiver.stop()
-            listener_host = os.environ.get("LISTEN_HOST", "0.0.0.0")
-            listener_port = int(os.environ.get("LISTEN_PORT", "9999"))
-            self._receiver = TCPReceiver(listener_host, listener_port, on_state=self._on_state)
+            host = os.environ.get("LISTEN_HOST", "0.0.0.0")
+            port = int(os.environ.get("LISTEN_PORT", "9999"))
+            self._receiver = TCPReceiver(host, port, on_state=self._on_state)
             self._receiver.start()
-            logger.info("TCP receiver restarted")
+            logger.info("TCP receiver restarted on %s:%s", host, port)
         except Exception as exc:
-            logger.error("Failed to reconnect: %s", exc)
+            logger.error("Reconnect error: %s", exc)
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Module entry point."""
     _configure_logging()
-    # Override log level from env
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.getLogger().setLevel(getattr(logging, log_level, logging.INFO))
     try:
