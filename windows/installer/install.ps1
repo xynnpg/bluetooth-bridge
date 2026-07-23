@@ -199,11 +199,22 @@ if (Test-Path $VENV_DIR) {
 
 $pipExe     = Join-Path $VENV_DIR "Scripts\pip.exe"
 $pythonExe  = Join-Path $VENV_DIR "Scripts\python.exe"    # pip / venv ops
-$pythonwExe = Join-Path $VENV_DIR "Scripts\pythonw.exe"   # no-console launcher
 
-# pythonw.exe may be absent in minimal Python installs; fall back gracefully
+# Find pythonw.exe — prefer the one in the venv, then whatever sits next to the
+# base Python we just resolved. uv-installed Python (and other "headless" distros)
+# do NOT ship pythonw.exe, so we may have to fall back to python.exe.
+$pythonwExe = Join-Path $VENV_DIR "Scripts\pythonw.exe"
 if (-not (Test-Path $pythonwExe)) {
-    Write-Warn "pythonw.exe not found — using python.exe (console will be hidden by the app itself)"
+    try {
+        $basePython = (& $pythonCmd -c "import sys; print(sys.executable)" 2>$null).Trim()
+        if ($basePython -and (Test-Path $basePython)) {
+            $siblingW = Join-Path (Split-Path $basePython -Parent) "pythonw.exe"
+            if (Test-Path $siblingW) { $pythonwExe = $siblingW }
+        }
+    } catch { }
+}
+if (-not (Test-Path $pythonwExe)) {
+    Write-Warn "pythonw.exe not available — using python.exe (the app will hide its own console window)"
     $pythonwExe = $pythonExe
 }
 
@@ -295,7 +306,7 @@ foreach ($dir in $shortcutDirs) {
             $lnk.Arguments        = "-m src.main"
             $lnk.WorkingDirectory = $INSTALL_DIR
             $lnk.Description      = "Xbox Controller Bluetooth Bridge"
-            $lnk.WindowStyle      = 7  # Minimised, no flash
+            $lnk.WindowStyle      = 1  # Normal — the app hides its own console
             $lnk.IconLocation     = "$env:SystemRoot\System32\shell32.dll,19"
             $lnk.Save()
         }

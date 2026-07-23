@@ -360,7 +360,7 @@ class _SettingsWindow:
         if os.path.exists(self._path):
             try:
                 self._cfg.read(self._path, encoding="utf-8-sig")
-            except configparser.Error as exc:
+            except (OSError, configparser.Error) as exc:
                 logger.warning("Could not read %s — using defaults: %s",
                                self._path, exc)
         self._build()

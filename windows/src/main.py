@@ -23,13 +23,29 @@ import time
 
 # ── Hide console window (works with both python.exe and pythonw.exe) ────────
 # With pythonw.exe there is no console so GetConsoleWindow returns 0 (safe).
-# With python.exe this removes the flash before the tray appears.
+# With python.exe the console is created by the parent (= our installer shortcut).
+# We poll from a side thread because at import time GetConsoleWindow can still
+# return 0 if the console hasn't fully materialised; we must also defeat the
+# "minimised to taskbar" state by SW_RESTORE + SW_HIDE and finally FreeConsole.
 if sys.platform == "win32":
     try:
-        import ctypes as _ctypes
-        _hwnd = _ctypes.windll.kernel32.GetConsoleWindow()
-        if _hwnd:
-            _ctypes.windll.user32.ShowWindow(_hwnd, 0)  # SW_HIDE
+        import threading as _threading
+        import time as _time
+        def _hide_console() -> None:
+            try:
+                import ctypes
+                for _ in range(60):
+                    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+                    if not hwnd:
+                        _time.sleep(0.05)
+                        continue
+                    ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                    ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+                    ctypes.windll.kernel32.FreeConsole()
+                    return
+            except Exception:
+                pass
+        _threading.Thread(target=_hide_console, daemon=True).start()
     except Exception:
         pass
 
