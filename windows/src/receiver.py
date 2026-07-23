@@ -48,12 +48,14 @@ class StateParser:
 class TCPReceiver:
     """TCP server that dispatches parsed state to a callback."""
 
-    def __init__(self, host: str, port: int, on_state, on_connect=None):
-        self.bind_host  = host
-        self.port       = port
-        self.on_state   = on_state
-        self.on_connect = on_connect   # optional: called with (ip: str) on new connection
-        self._running   = False
+    def __init__(self, host: str, port: int, on_state, on_connect=None, on_ping=None, on_disconnect=None):
+        self.bind_host     = host
+        self.port          = port
+        self.on_state      = on_state
+        self.on_connect    = on_connect
+        self.on_ping       = on_ping
+        self.on_disconnect = on_disconnect
+        self._running      = False
         self._thread: threading.Thread | None = None
         self._listener: socket.socket | None = None
 
@@ -133,6 +135,11 @@ class TCPReceiver:
                     buf = buf[_PAYLOAD_SIZE:]
                     state = StateParser.parse(packet)
                     if state is None:
+                        if self.on_ping:
+                            try:
+                                self.on_ping()
+                            except Exception:
+                                pass
                         continue  # PING
                     try:
                         self.on_state(state)
@@ -147,3 +154,8 @@ class TCPReceiver:
                 pass
             conn.close()
             logger.info("Connection closed: %s", addr[0])
+            if self.on_disconnect:
+                try:
+                    self.on_disconnect(addr[0])
+                except Exception:
+                    pass

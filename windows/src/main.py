@@ -22,30 +22,13 @@ import threading
 import time
 
 # ── Hide console window (works with both python.exe and pythonw.exe) ────────
-# With pythonw.exe there is no console so GetConsoleWindow returns 0 (safe).
-# With python.exe the console is created by the parent (= our installer shortcut).
-# We poll from a side thread because at import time GetConsoleWindow can still
-# return 0 if the console hasn't fully materialised; we must also defeat the
-# "minimised to taskbar" state by SW_RESTORE + SW_HIDE and finally FreeConsole.
 if sys.platform == "win32":
     try:
-        import threading as _threading
-        import time as _time
-        def _hide_console() -> None:
-            try:
-                import ctypes
-                for _ in range(60):
-                    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-                    if not hwnd:
-                        _time.sleep(0.05)
-                        continue
-                    ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-                    ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
-                    ctypes.windll.kernel32.FreeConsole()
-                    return
-            except Exception:
-                pass
-        _threading.Thread(target=_hide_console, daemon=True).start()
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+            ctypes.windll.kernel32.FreeConsole()
     except Exception:
         pass
 
@@ -149,6 +132,8 @@ class BridgeApp:
             listener_host, listener_port,
             on_state=self._on_state,
             on_connect=self._on_connect,
+            on_ping=self._on_ping,
+            on_disconnect=self._on_disconnect,
         )
         self._receiver.start()
 
@@ -180,7 +165,22 @@ class BridgeApp:
         logger.info("Linux bridge connected from %s", peer_ip)
         self._peer_ip = peer_ip
         self._pc_reachable = True
+        self._last_recv = time.monotonic()
         self._tray.update(connected=True, pc_reachable=True, peer_ip=peer_ip)
+
+    def _on_ping(self) -> None:
+        """Called when a keepalive PING frame is received from Linux."""
+        if not self._pc_reachable:
+            self._pc_reachable = True
+            logger.info("Linux bridge keepalive received")
+            self._tray.update(connected=True, pc_reachable=True, peer_ip=self._peer_ip)
+        self._last_recv = time.monotonic()
+
+    def _on_disconnect(self, peer_ip: str) -> None:
+        """Called when Linux disconnects the TCP connection."""
+        logger.info("Linux bridge disconnected from %s", peer_ip)
+        self._pc_reachable = False
+        self._tray.update(connected=False, pc_reachable=False, peer_ip=self._peer_ip)
 
     def _on_state(self, state: dict) -> None:
         """Called for every received controller state packet."""
@@ -209,12 +209,9 @@ class BridgeApp:
 
             if self._pc_reachable:
                 elapsed = time.monotonic() - self._last_recv
-                if elapsed > 3.0 and not self._controller_ok:
+                if elapsed > 6.0:
                     self._pc_reachable = False
                     logger.warning("Linux bridge gone (%.1f s silence)", elapsed)
-
-            # Reset per-cycle flag
-            self._controller_ok = False
 
             self._tray.update(
                 connected=self._pc_reachable,

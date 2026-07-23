@@ -112,9 +112,7 @@ def open_log_viewer(log_path: str) -> None:
     """Open (or raise) the log viewer in a daemon thread."""
     for w in list(_OPEN_LOGVIEWER):
         try:
-            w.after(0, w.lift)
-            w.after(0, w.focus_force)
-            return
+            w.lift(); w.focus_force(); return
         except (tk.TclError, RuntimeError):
             _OPEN_LOGVIEWER.remove(w)
     threading.Thread(target=_run_log_viewer, args=(log_path,), daemon=True).start()
@@ -323,9 +321,7 @@ def open_settings(config_path: str, on_log_level_change=None) -> None:
     """Open (or raise) the settings window."""
     for w in list(_OPEN_SETTINGS):
         try:
-            w.after(0, w.lift)
-            w.after(0, w.focus_force)
-            return
+            w.lift(); w.focus_force(); return
         except (tk.TclError, RuntimeError):
             _OPEN_SETTINGS.remove(w)
     threading.Thread(
@@ -358,6 +354,8 @@ class _SettingsWindow:
         _centre(r, 440, 500)
         r.protocol("WM_DELETE_WINDOW", self._close)
         if os.path.exists(self._path):
+            # utf-8-sig strips the BOM (\ufeff) that Windows Notepad/PowerShell
+            # adds when saving UTF-8 files
             try:
                 self._cfg.read(self._path, encoding="utf-8-sig")
             except (OSError, configparser.Error) as exc:
@@ -432,7 +430,9 @@ class _SettingsWindow:
     def _entry_row(self, parent, label: str, widget: tk.Widget) -> None:
         f = tk.Frame(parent, bg=BG)
         f.pack(fill="x", pady=5)
-        _lbl(f, label, color=MUTED, bg=BG).pack(side="left", anchor="w", width=120)
+        # 'width' is a widget option, NOT a pack option — must go in the Label constructor
+        tk.Label(f, text=label, bg=BG, fg=MUTED,
+                 font=("Segoe UI", 9), width=18, anchor="w").pack(side="left")
         widget.pack(side="left", ipady=4)
 
     def _save(self) -> None:
