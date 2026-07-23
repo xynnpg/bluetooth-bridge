@@ -263,14 +263,15 @@ if ($ips.Count -eq 0) {
 
 Write-Step "Writing configuration …"
 
-@"
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText("$INSTALL_DIR\config.ini", @"
 [app]
 listen_port = $LISTEN_PORT
 auto_start  = true
 
 [network]
 discovery_port = 9876
-"@ | Set-Content -Path "$INSTALL_DIR\config.ini" -Encoding UTF8
+"@, $utf8NoBom)
 
 Write-Success "Configuration written to $INSTALL_DIR\config.ini"
 

@@ -112,8 +112,10 @@ def open_log_viewer(log_path: str) -> None:
     """Open (or raise) the log viewer in a daemon thread."""
     for w in list(_OPEN_LOGVIEWER):
         try:
-            w.lift(); w.focus_force(); return
-        except tk.TclError:
+            w.after(0, w.lift)
+            w.after(0, w.focus_force)
+            return
+        except (tk.TclError, RuntimeError):
             _OPEN_LOGVIEWER.remove(w)
     threading.Thread(target=_run_log_viewer, args=(log_path,), daemon=True).start()
 
@@ -321,8 +323,10 @@ def open_settings(config_path: str, on_log_level_change=None) -> None:
     """Open (or raise) the settings window."""
     for w in list(_OPEN_SETTINGS):
         try:
-            w.lift(); w.focus_force(); return
-        except tk.TclError:
+            w.after(0, w.lift)
+            w.after(0, w.focus_force)
+            return
+        except (tk.TclError, RuntimeError):
             _OPEN_SETTINGS.remove(w)
     threading.Thread(
         target=_run_settings,
@@ -354,7 +358,11 @@ class _SettingsWindow:
         _centre(r, 440, 500)
         r.protocol("WM_DELETE_WINDOW", self._close)
         if os.path.exists(self._path):
-            self._cfg.read(self._path, encoding="utf-8")
+            try:
+                self._cfg.read(self._path, encoding="utf-8-sig")
+            except configparser.Error as exc:
+                logger.warning("Could not read %s — using defaults: %s",
+                               self._path, exc)
         self._build()
         r.mainloop()
 
