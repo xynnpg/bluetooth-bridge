@@ -270,7 +270,34 @@ if ($ips.Count -eq 0) {
     Write-Info "Selected: $localIp"
 }
 
-# ── 7. Write config.ini ───────────────────────────────────────────────────────
+# ── 6. Build Standalone GUI Executable ────────────────────────────────────────
+
+Write-Step "Building standalone GUI application (no console) …"
+
+$pyinstallerExe = Join-Path $VENV_DIR "Scripts\pyinstaller.exe"
+if (-not (Test-Path $pyinstallerExe)) {
+    & $pipExe install pyinstaller --quiet 2>$null | Out-Null
+}
+
+$exePath = "$INSTALL_DIR\BluetoothBridge.exe"
+try {
+    & $pythonExe -m PyInstaller `
+        --noconsole `
+        --onefile `
+        --name BluetoothBridge `
+        --distpath $INSTALL_DIR `
+        --workpath "$env:TEMP\build_bb" `
+        --specpath "$env:TEMP\spec_bb" `
+        --collect-all vgamepad `
+        --collect-all pystray `
+        --collect-all PIL `
+        "$INSTALL_DIR\src\main.py" 2>$null | Out-Null
+    Write-Success "Built native GUI executable: $exePath"
+} catch {
+    Write-Warn "PyInstaller build warning: $_"
+}
+
+# ── 7. Write config.ini & launch.vbs ──────────────────────────────────────────
 
 Write-Step "Writing configuration …"
 
@@ -284,13 +311,22 @@ auto_start  = true
 discovery_port = 9876
 "@, $utf8NoBom)
 
+# Fallback VBS launcher if needed
+$vbsPath = "$INSTALL_DIR\launch.vbs"
+$targetExe = if (Test-Path $exePath) { $exePath } else { $pythonwExe }
+$vbsContent = @"
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.CurrentDirectory = "$INSTALL_DIR"
+WshShell.Run """$targetExe"" -m src.main", 0, False
+"@
+[System.IO.File]::WriteAllText($vbsPath, $vbsContent, $utf8NoBom)
+
 Write-Success "Configuration written to $INSTALL_DIR\config.ini"
 
 # ── 8. Create Start Menu + Startup shortcuts ──────────────────────────────────
 
 Write-Step "Creating shortcuts …"
 
-$appScript     = Join-Path $INSTALL_DIR "src\main.py"
 $shortcutDirs  = @(
     "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
     "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"
@@ -299,17 +335,21 @@ $shortcutDirs  = @(
 foreach ($dir in $shortcutDirs) {
     try {
         $shortcutPath = Join-Path $dir "Bluetooth Bridge.lnk"
-        if (-not (Test-Path $shortcutPath)) {
-            $ws  = New-Object -ComObject WScript.Shell
-            $lnk = $ws.CreateShortcut($shortcutPath)
-            $lnk.TargetPath       = $pythonwExe
-            $lnk.Arguments        = "-m src.main"
+        if (Test-Path $shortcutPath) { Remove-Item $shortcutPath -Force }
+        $ws  = New-Object -ComObject WScript.Shell
+        $lnk = $ws.CreateShortcut($shortcutPath)
+        if (Test-Path $exePath) {
+            $lnk.TargetPath       = $exePath
             $lnk.WorkingDirectory = $INSTALL_DIR
-            $lnk.Description      = "Xbox Controller Bluetooth Bridge"
-            $lnk.WindowStyle      = 1  # Normal — the app hides its own console
-            $lnk.IconLocation     = "$env:SystemRoot\System32\shell32.dll,19"
-            $lnk.Save()
+        } else {
+            $lnk.TargetPath       = "$env:SystemRoot\System32\wscript.exe"
+            $lnk.Arguments        = "`"$vbsPath`""
+            $lnk.WorkingDirectory = $INSTALL_DIR
         }
+        $lnk.Description      = "Xbox Controller Bluetooth Bridge"
+        $lnk.WindowStyle      = 7  # Minimized / Hidden
+        $lnk.IconLocation     = "$env:SystemRoot\System32\shell32.dll,19"
+        $lnk.Save()
     } catch {
         Write-Warn "Could not create shortcut in ${dir}: $_"
     }
@@ -321,16 +361,23 @@ Write-Success "Shortcuts created."
 Write-Host ""
 Write-Step "Starting Bluetooth Bridge …"
 
-# Set env vars in the current session before launching; Start-Process inherits them.
+# Set env vars in current session before launching
 $env:LISTEN_HOST = "0.0.0.0"
 $env:LISTEN_PORT = "$LISTEN_PORT"
 $env:LOG_LEVEL   = "INFO"
 
-$proc = Start-Process `
-    -FilePath $pythonwExe `
-    -ArgumentList "-m src.main" `
-    -WorkingDirectory $INSTALL_DIR `
-    -PassThru
+if (Test-Path $exePath) {
+    $proc = Start-Process `
+        -FilePath $exePath `
+        -WorkingDirectory $INSTALL_DIR `
+        -PassThru
+} else {
+    $proc = Start-Process `
+        -FilePath "$env:SystemRoot\System32\wscript.exe" `
+        -ArgumentList "`"$vbsPath`"" `
+        -WorkingDirectory $INSTALL_DIR `
+        -PassThru
+}
 
 Start-Sleep 3
 
