@@ -120,6 +120,34 @@ if (-not $vigembInstalled) {
     Write-Success "ViGEmBus already installed."
 }
 
+# ── 2b. Configure Windows Defender Firewall ──────────────────────────────────
+
+Write-Step "Configuring Windows Defender Firewall …"
+
+try {
+    Remove-NetFirewallRule -DisplayName "Xbox Bluetooth Bridge" -ErrorAction SilentlyContinue
+    Remove-NetFirewallRule -DisplayName "Xbox Bluetooth Bridge Discovery" -ErrorAction SilentlyContinue
+
+    New-NetFirewallRule -DisplayName "Xbox Bluetooth Bridge" `
+                        -Direction Inbound `
+                        -Action Allow `
+                        -Protocol TCP `
+                        -LocalPort 9999 `
+                        -Enabled True | Out-Null
+
+    New-NetFirewallRule -DisplayName "Xbox Bluetooth Bridge Discovery" `
+                        -Direction Inbound `
+                        -Action Allow `
+                        -Protocol UDP `
+                        -LocalPort 9876 `
+                        -Enabled True | Out-Null
+
+    Write-Success "Firewall inbound rules added (TCP 9999, UDP 9876)."
+} catch {
+    Write-Warn "Could not auto-configure Firewall: $_"
+}
+
+
 # ── 3. Create install directory ───────────────────────────────────────────────
 
 Write-Step "Installing to $INSTALL_DIR …"
