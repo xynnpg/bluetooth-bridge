@@ -172,6 +172,7 @@ class BridgeApp:
             state = read_next_state(self._device, self._abs_info, self._state)
             # Apply host-driven rumble to the controller
             self._maybe_rumble(state)
+            self._debug_log_state(state)
             if self._tcp.send(state.to_bytes()):
                 return  # sent ok
             # If send failed, sleep and retry until reconnected
@@ -192,6 +193,26 @@ class BridgeApp:
         self._last_rumble = (rl, rr)
         with self._rumble_lock:
             self._rumble.apply(rl, rr)
+
+    _debug_last_log = 0.0
+
+    def _debug_log_state(self, state) -> None:
+        """At 1 Hz, log buttons_low/high and dpad as hex. Helps diagnose
+        "buttons don't work" — if the bits ARE being captured here, the
+        problem is on the Windows side; if they aren't, it's the kernel."""
+        now = time.monotonic()
+        if now - self._debug_last_log < 1.0:
+            return
+        self._debug_last_log = now
+        if state.buttons_low or state.buttons_high or state.dpad:
+            logger.info(
+                "state: bl=0x%02x bh=0x%02x dpad=0x%02x rumble=(%d,%d) batt=%d%%",
+                state.buttons_low & 0xFF,
+                state.buttons_high & 0xFF,
+                state.dpad & 0xFF,
+                state.rumble_left, state.rumble_right,
+                state.battery,
+            )
 
     def _battery_poll_loop(self) -> None:
         """Background poller for `bluetoothctl info` battery readings.
