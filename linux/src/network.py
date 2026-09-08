@@ -10,7 +10,7 @@ import time
 
 logger = logging.getLogger("network")
 
-_PAYLOAD_SIZE = 24
+_PAYLOAD_SIZE = 54
 # All-0xFF = PING packet (connection keepalive, sent every 1s when idle)
 _PING_PAYLOAD = b"\xff" * _PAYLOAD_SIZE
 

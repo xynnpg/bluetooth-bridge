@@ -79,6 +79,8 @@ class TrayManager:
         on_exit:               Callable[[], None],
         on_restart_controller: Callable[[], None] | None = None,
         on_reconnect:          Callable[[], None] | None = None,
+        on_open_app:           Callable[[], None] | None = None,
+        on_settings_change:    Callable[[dict], None] | None = None,
     ) -> None:
         if not _TRAY_AVAILABLE:
             logger.warning("pystray / Pillow not available — tray icon disabled")
@@ -88,6 +90,8 @@ class TrayManager:
         self._on_exit               = on_exit
         self._on_restart_controller = on_restart_controller
         self._on_reconnect          = on_reconnect
+        self._on_open_app           = on_open_app
+        self._on_settings_change    = on_settings_change
 
         self._icon: "pystray.Icon | None" = None
         self._running   = False
@@ -100,6 +104,13 @@ class TrayManager:
         self._log_path: str | None = None
         self._connected    = False
         self._peer_ip      = ""
+
+        # Live state (set later via set_state)
+        self._state = None
+        self._battery         = -1
+        self._charging        = False
+        self._controller_name = ""
+        self._controller_mac  = ""
 
     # ------------------------------------------------------------------
     # Public setters (thread-safe)
@@ -116,6 +127,10 @@ class TrayManager:
 
     def set_config_path(self, path: str) -> None:
         self._config_path = path
+
+    def set_state(self, state) -> None:
+        """Hand the tray a reference to the live BridgeState (for tooltip)."""
+        self._state = state
 
     # ------------------------------------------------------------------
     # Main-thread entry point (replaces start() + thread)
@@ -170,16 +185,24 @@ class TrayManager:
             else:
                 return "○ Waiting for controller…"
 
+        def _battery_title(item):  # noqa: ARG001
+            if self._battery is None or self._battery < 0:
+                return "Battery:  --"
+            glyph = "⚡" if self._charging else "  "
+            return f"Battery:  {self._battery}%  {glyph}"
+
         return pystray.Menu(
             # ── Header ──────────────────────────────────────────────
             pystray.MenuItem(f"Xbox Bridge  {VERSION}", None, enabled=False),
             pystray.MenuItem(_status_title,             None, enabled=False),
+            pystray.MenuItem(_battery_title,            None, enabled=False),
             pystray.Menu.SEPARATOR,
 
-            # ── Logs & files ─────────────────────────────────────────
-            pystray.MenuItem("View Logs",            self._handle_view_logs),
-            pystray.MenuItem("Copy Log to Clipboard",self._handle_copy_logs),
-            pystray.MenuItem("Open App Folder",      self._handle_open_folder),
+            # ── Open App (dashboard) ────────────────────────────────
+            pystray.MenuItem("Open App",               self._handle_open_app),
+            pystray.MenuItem("View Logs",              self._handle_view_logs),
+            pystray.MenuItem("Copy Log to Clipboard",  self._handle_copy_logs),
+            pystray.MenuItem("Open App Folder",        self._handle_open_folder),
             pystray.Menu.SEPARATOR,
 
             # ── Controller / connection ───────────────────────────────
@@ -201,20 +224,30 @@ class TrayManager:
     # Status update (thread-safe)
     # ------------------------------------------------------------------
 
-    def update(self, *, connected: bool, pc_reachable: bool, peer_ip: str = "") -> None:
+    def update(self, *, connected: bool, pc_reachable: bool, peer_ip: str = "",
+               battery: int | None = None, charging: bool | None = None,
+               controller_name: str = "", controller_mac: str = "") -> None:
         if not _TRAY_AVAILABLE or not self._icon:
             return
 
         self._connected = connected and pc_reachable
         if peer_ip:
             self._peer_ip = peer_ip
+        if battery is not None:
+            self._battery = battery
+        if charging is not None:
+            self._charging = bool(charging)
+        if controller_name:
+            self._controller_name = controller_name
+        if controller_mac:
+            self._controller_mac  = controller_mac
 
         if connected and pc_reachable:
             color   = _COLOR_ONLINE
-            tooltip = f"Xbox Bridge — streaming to {self._peer_ip or 'PC'}"
+            tooltip = self._build_tooltip(streaming=True)
         elif connected:
             color   = _COLOR_WARN
-            tooltip = "Xbox Bridge — controller ready, PC reconnecting…"
+            tooltip = self._build_tooltip(streaming=False)
         else:
             color   = _COLOR_OFFLINE
             tooltip = "Xbox Bridge — waiting for controller"
@@ -225,6 +258,17 @@ class TrayManager:
             self._icon.menu  = self._build_menu()
         except Exception as exc:
             logger.debug("Tray update error: %s", exc)
+
+    def _build_tooltip(self, *, streaming: bool) -> str:
+        if self._battery is not None and self._battery >= 0:
+            bat = f" · {self._battery}%"
+            if self._charging:
+                bat += " ⚡"
+        else:
+            bat = ""
+        if streaming:
+            return f"Xbox Bridge{bat} — streaming to {self._peer_ip or 'PC'}"
+        return f"Xbox Bridge{bat} — controller ready, PC reconnecting…"
 
     def stop(self) -> None:
         self._running = False
@@ -244,6 +288,15 @@ class TrayManager:
         if self._icon:
             self._icon.stop()
         self._on_exit()
+
+    def _handle_open_app(self, _=None) -> None:
+        if self._on_open_app:
+            try:
+                self._on_open_app()
+            except Exception as exc:
+                logger.error("Open App error: %s", exc)
+        else:
+            self._notify("Dashboard not available.", title="Xbox Bridge")
 
     def _handle_view_logs(self, _=None) -> None:
         path = self._log_path
@@ -322,7 +375,11 @@ class TrayManager:
                 "bluetooth_bridge", "config.ini"
             )
         if _UI_AVAILABLE:
-            _ui.open_settings(config, on_log_level_change=self._on_log_level_change)
+            _ui.open_settings(
+                config,
+                on_log_level_change=self._on_log_level_change,
+                on_settings_change=self._on_settings_change,
+            )
         else:
             # Fallback to notepad
             if os.path.exists(config):
@@ -339,6 +396,11 @@ class TrayManager:
         _logging.getLogger().setLevel(getattr(_logging, level, _logging.INFO))
         logger.info("Log level changed to %s", level)
 
+    def _on_settings_change(self, values: dict) -> None:
+        """Called after a successful save in the settings window."""
+        logger.info("Settings changed: %s", {k: v for k, v in values.items()
+                                            if k not in ("listen_port", "listen_host")})
+
     def _handle_about(self, _=None) -> None:
         lines = [
             f"Xbox Bridge  v{VERSION}",
@@ -346,6 +408,15 @@ class TrayManager:
         ]
         if self._peer_ip:
             lines.append(f"Linux bridge:  {self._peer_ip}")
+        if self._controller_name:
+            lines.append(f"Controller:   {self._controller_name}")
+        if self._controller_mac:
+            lines.append(f"MAC:           {self._controller_mac}")
+        if self._battery is not None and self._battery >= 0:
+            bat = f"{self._battery}%"
+            if self._charging:
+                bat += " (charging)"
+            lines.append(f"Battery:       {bat}")
         if self._log_path:
             lines.append(f"Log:  {self._log_path}")
         self._notify("\n".join(lines), title="About Xbox Bridge")

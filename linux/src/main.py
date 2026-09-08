@@ -16,12 +16,16 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 
 from .bluetooth import ensure_paired
-from .controller import build_abs_info, find_controller, make_state, read_next_state
+from .controller import (
+    PAYLOAD_SIZE, build_abs_info, find_controller, make_state, read_next_state,
+)
 from .discovery import DiscoveryListener
 from .network import TCPStreamer
+from .rumble import RumbleWriter, find_hidraw_by_mac, find_hidraw_for
 
 logger = logging.getLogger("main")
 
@@ -34,6 +38,11 @@ class BridgeApp:
         self._abs_info: dict = {}
         self._state = None          # persistent ControllerState
         self._controller_mac = os.getenv("CONTROLLER_MAC", "").strip() or None
+        self._rumble = RumbleWriter()
+        self._rumble_lock = threading.Lock()
+        self._last_rumble = (0, 0)
+        self._start_time = time.monotonic()
+        self._bt_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -42,6 +51,7 @@ class BridgeApp:
     def run(self) -> None:
         self._running = True
         self._register_signals()
+        self._start_time = time.monotonic()
 
         pc_host, pc_port = self._resolve_host_port()
 
@@ -64,6 +74,7 @@ class BridgeApp:
 
         logger.info("Shutting down …")
         self._tcp.stop()
+        self._rumble.close()
 
     # ------------------------------------------------------------------
     # Setup helpers
@@ -73,14 +84,13 @@ class BridgeApp:
         logger.info("Setting up Bluetooth …")
         # Run in a thread — the kernel driver handles the actual BT connection.
         # We just need the device node to exist.
-        import threading
-        t = threading.Thread(
+        self._bt_thread = threading.Thread(
             target=ensure_paired,
             args=(self._controller_mac,),
             name="BluetoothSetup",
             daemon=True,
         )
-        t.start()
+        self._bt_thread.start()
         # Give it a few seconds before we try to open /dev/input
         time.sleep(5)
 
@@ -91,7 +101,12 @@ class BridgeApp:
                 self._device = find_controller()
                 self._abs_info = build_abs_info(self._device)
                 self._state = make_state(self._device, self._abs_info)
-                logger.info("Controller device: %s", self._device.path)
+                if self._state is not None:
+                    self._state.controller_mac = self._controller_mac or ""
+                    self._state.controller_name = self._device.name or ""
+                logger.info("Controller device: %s (%s)",
+                            self._device.path, self._device.name)
+                self._open_rumble()
                 return
             except RuntimeError:
                 pass
@@ -102,6 +117,21 @@ class BridgeApp:
             "Ensure the controller is paired and powered on."
         )
 
+    def _open_rumble(self) -> None:
+        """Locate and open the hidraw node that backs the current evdev device."""
+        hidraw = find_hidraw_for(self._device.path)
+        if not hidraw and self._controller_mac:
+            hidraw = find_hidraw_by_mac(self._controller_mac)
+        if hidraw:
+            with self._rumble_lock:
+                self._rumble.set_device(hidraw)
+        else:
+            logger.warning(
+                "No hidraw node found for %s — vibration disabled. "
+                "Mount /dev/hidraw into the container to enable it.",
+                self._device.path,
+            )
+
 
     # ------------------------------------------------------------------
     # Main loop
@@ -110,6 +140,8 @@ class BridgeApp:
     def _poll(self) -> None:
         try:
             state = read_next_state(self._device, self._abs_info, self._state)
+            # Apply host-driven rumble to the controller
+            self._maybe_rumble(state)
             if self._tcp.send(state.to_bytes()):
                 return  # sent ok
             # If send failed, sleep and retry until reconnected
@@ -118,15 +150,29 @@ class BridgeApp:
             logger.error("Device read error: %s", exc)
             self._reconnect_device()
 
+    def _maybe_rumble(self, state) -> None:
+        rl, rr = state.rumble_left, state.rumble_right
+        if (rl, rr) == self._last_rumble:
+            return
+        self._last_rumble = (rl, rr)
+        with self._rumble_lock:
+            self._rumble.apply(rl, rr)
+
     def _reconnect_device(self) -> None:
         logger.info("Attempting to re-open controller device …")
+        with self._rumble_lock:
+            self._rumble.close()
         self._device = None
         for _ in range(30):
             try:
                 self._device = find_controller()
                 self._abs_info = build_abs_info(self._device)
                 self._state = make_state(self._device, self._abs_info)
+                if self._state is not None:
+                    self._state.controller_mac = self._controller_mac or ""
+                    self._state.controller_name = self._device.name or ""
                 logger.info("Controller reconnected at %s", self._device.path)
+                self._open_rumble()
                 return
             except RuntimeError:
                 pass

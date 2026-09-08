@@ -29,6 +29,22 @@ Auto-discovery means you don't type IPs anywhere — Windows announces itself an
 
 ---
 
+## Features
+
+- **Plug-and-play virtual Xbox 360 controller** — no game-side configuration
+- **Battery level** — Linux reads the controller's battery/charging status
+  over `EV_MSC` (or `ABS_MISC` as a fallback) and surfaces it on the
+  Windows dashboard and tray tooltip in real time
+- **Vibration / rumble** — game rumble is forwarded from the Windows host
+  back to the physical controller over the same TCP connection, so games
+  that vibrate the virtual pad also vibrate the real one
+- **Controller identity** — the controller's name and MAC address are sent
+  with every packet and shown on the dashboard
+- **Live event log** — recent log lines stream into the dashboard for quick
+  at-a-glance debugging without opening the log file
+
+---
+
 ## Prerequisites
 
 | | Linux | Windows |
@@ -69,13 +85,20 @@ On your Linux server, run:
 curl -fsSL https://raw.githubusercontent.com/xynnpg/bluetooth-bridge/main/linux/install.sh | bash
 ```
 
-> Replace `user` with your GitHub username before running.
+Or pass your **Windows IP** and **Controller MAC** directly as arguments:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xynnpg/bluetooth-bridge/main/linux/install.sh | bash -s <WINDOWS_IP> [CONTROLLER_MAC]
+# Example:
+curl -fsSL https://raw.githubusercontent.com/xynnpg/bluetooth-bridge/main/linux/install.sh | bash -s 192.168.0.132 44:16:22:15:A1:31
+```
 
 The installer will:
 - Check for Docker and Bluetooth
-- Prompt you to select your Xbox controller (pair it if needed)
-- Start the Docker container in the background
-- Show the final status
+- Prompt for your **Windows PC IP address** (e.g. `192.168.0.132`)
+- Prompt for your **Xbox Controller MAC address** (e.g. `44:16:22:15:A1:31` or auto-detect paired Xbox devices)
+- Generate `~/.bluetooth-bridge/.env` and start the Docker container
+- Auto-recreate the container whenever `.env` settings are updated
 
 **The container auto-starts on boot** via systemd.
 
@@ -91,7 +114,10 @@ Once both sides are installed, just:
 
 ### Checking status
 
-**Windows:** Right-click the tray icon → *View Logs* or hover for status.
+**Windows:** Right-click the tray icon → *Open App* for the live dashboard
+(controller name, MAC, battery % with bar, current rumble motors, peer IP,
+uptime, packet count, and a scrolling list of recent events). The tray
+icon's hover tooltip also shows the current battery %.
 
 **Linux:**
 ```bash
@@ -118,27 +144,45 @@ systemctl daemon-reload
 
 ```ini
 [app]
-listen_port = 9999
-auto_start  = true
+listen_port   = 9999
+listen_host   = 0.0.0.0
+auto_start    = true
+auto_discover = true
+
+[controller]
+rumble_enabled      = true
+low_battery_warn_pct = 15
+
+[tray]
+show_battery         = true
+open_app_on_launch   = false
 ```
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `listen_port` | `9999` | TCP port Windows listens on |
-| `auto_start` | `true` | Start with Windows |
+| Section | Key | Default | Description |
+|---------|-----|---------|-------------|
+| `app`        | `listen_port`   | `9999`    | TCP port Windows listens on |
+| `app`        | `listen_host`   | `0.0.0.0` | Bind address |
+| `app`        | `auto_start`    | `true`    | Start with Windows |
+| `app`        | `auto_discover` | `true`    | Broadcast IP for Linux auto-discovery (UDP 9876) |
+| `controller` | `rumble_enabled`| `true`    | Forward game rumble back to the controller |
+| `controller` | `low_battery_warn_pct` | `15` | Low-battery threshold (for future use) |
+| `tray`       | `show_battery`  | `true`    | Show battery % in tray tooltip |
+| `tray`       | `open_app_on_launch` | `false` | Pop the dashboard when the app starts |
 
 ### Linux config (`~/.bluetooth-bridge/.env`)
 
 ```env
-# Use 'auto' for zero-config discovery, or set the Windows IP manually
-PC_HOST=auto
+# Windows PC IP address
+PC_HOST=192.168.0.132
 
 # TCP port — must match Windows config
 PC_PORT=9999
 
-# Leave blank to auto-discover the controller, or set MAC (AA:BB:CC:DD:EE:FF)
-CONTROLLER_MAC=
+# Pre-known controller MAC (e.g. 44:16:22:15:A1:31), or leave blank for auto-discovery
+CONTROLLER_MAC=44:16:22:15:A1:31
 ```
+
+> **Note:** After editing `~/.bluetooth-bridge/.env` manually, run `cd ~/.bluetooth-bridge && sudo docker compose up -d --force-recreate` so Docker re-reads the new settings.
 
 ### Manual IP override (Linux)
 
@@ -151,23 +195,48 @@ PC_HOST=192.168.1.101
 
 ## Network Packets
 
-Fixed 24-byte binary frames at ~60 Hz — no JSON overhead.
+Fixed 54-byte v2 binary frames at ~60 Hz — no JSON overhead. The connection is
+full-duplex: state flows Linux → Windows, while game rumble flows
+Windows → Linux (same socket, same packet format).
 
-| Offset | Size | Field | Range |
-|--------|------|-------|-------|
+| Offset | Size | Field | Range / Notes |
+|--------|------|-------|---------------|
 | 0–1   | 2 | `lthumb_x` | 0–65535 (centre=32768) |
 | 2–3   | 2 | `lthumb_y` | 0–65535 |
 | 4–5   | 2 | `rthumb_x` | 0–65535 |
 | 6–7   | 2 | `rthumb_y` | 0–65535 |
 | 8     | 1 | `lt` | 0–255 |
 | 9     | 1 | `rt` | 0–255 |
-| 10    | 1 | `buttons_low` | Bitfield (A=1 B=2 X=4 Y=8 LB=16 RB=32 Back=64 Start=128) |
-| 11    | 1 | `buttons_high` | Bitfield (L3=1 R3=2 Guide=4) |
+| 10    | 1 | `buttons_low` | A=1 B=2 X=4 Y=8 LB=16 RB=32 Back=64 Start=128 |
+| 11    | 1 | `buttons_high` | L3=1 R3=2 Guide=4 |
 | 12    | 1 | `dpad` | UP=1 RIGHT=2 DOWN=4 LEFT=8 (independent bits) |
-| 13    | 1 | reserved | — |
-| 14–23 | 10 | padding | — |
+| 13    | 1 | `proto` | `0x02` for v2. Receiver uses this to pick the parser. |
+| 14    | 1 | `battery` | 0–100, `0xFF` = unknown |
+| 15    | 1 | `flags` | bit0 = charging, bit1 = battery-valid |
+| 16    | 1 | `rumble_left`  | 0–255 (large motor) |
+| 17    | 1 | `rumble_right` | 0–255 (small motor) |
+| 18–23 | 6 | `mac` | 6 raw bytes, e.g. `AA BB CC DD EE FF` (zeros if unknown) |
+| 24–39 | 16 | `name` | ASCII, NUL-padded, truncated to 16 chars |
+| 40–53 | 14 | `padding` | zeros |
 
-Ping frame (all `\xff`) sent every second as a keepalive.
+Ping frame (54 × `\xff`) sent every second as a keepalive.
+
+### Backward compatibility
+
+If byte 13 is not `0x02`, the receiver falls back to a legacy v1 parser that
+reads the first 14 bytes and treats the new fields as "unknown" — so a v1
+sender will appear with battery=unknown and rumble=0 on a v2 receiver.
+
+### Reverse channel — game rumble
+
+When a Windows game calls `XInputSetState`, ViGEmBus notifies the bridge.
+The new motor speeds are encoded as a v2 packet and sent back to the Linux
+side over the same TCP socket. The Linux side opens the controller's
+`/dev/hidraw*` node and writes a 13-byte Xbox One rumble output report
+to make the controller physically vibrate.
+
+`/dev/hidraw` is mounted into the Linux container by the bundled
+`docker-compose.yml` — no extra configuration needed.
 
 ### Latency
 
@@ -232,9 +301,10 @@ bluetooth-bridge/
 │   ├── xbox-bridge.service
 │   └── src/
 │       ├── main.py         # Entry point
-│       ├── controller.py   # evdev → 24-byte packets
+│       ├── controller.py   # evdev → 54-byte v2 packets (battery, identity)
 │       ├── network.py      # TCP client
 │       ├── bluetooth.py   # bluetoothctl pairing
+│       ├── rumble.py      # hidraw rumble output reports
 │       └── discovery.py    # UDP auto-discovery
 └── windows/
     ├── installer/
@@ -244,9 +314,11 @@ bluetooth-bridge/
     ├── requirements.txt
     └── src/
         ├── main.py         # Entry point
-        ├── receiver.py     # TCP server
-        ├── emitter.py      # vgamepad → ViGEmBus
+        ├── receiver.py     # TCP server (v2 + v1 fallback)
+        ├── emitter.py      # vgamepad → ViGEmBus (with rumble notifications)
         ├── tray.py         # System tray
+        ├── ui.py           # Dashboard, Settings, Log Viewer (Tk)
+        ├── state.py        # Thread-safe live state shared by tray/UI
         └── discovery.py    # UDP broadcaster
 ```
 

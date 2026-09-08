@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 
 logger = logging.getLogger("emitter")
 
@@ -24,7 +25,7 @@ except ImportError:
 class XInputEmitter:
     """Sends XInput reports to ViGEmBus via vgamepad."""
 
-    def __init__(self, slot: int = 0):
+    def __init__(self, slot: int = 0, on_rumble=None):
         # slot parameter is accepted for API compat
         # vgamepad uses a single default slot internally
         if not _VGAMEPAD_AVAILABLE:
@@ -36,6 +37,17 @@ class XInputEmitter:
 
         self._pad = _vg.VX360Gamepad()
         self._active = True
+        self._on_rumble = on_rumble
+        self._last_rumble = (0, 0)
+        self._rumble_lock = threading.Lock()
+
+        # Register the rumble notification callback so the host's XInput
+        # rumble commands reach us. The callback signature is fixed by vgamepad.
+        if on_rumble is not None:
+            try:
+                self._pad.register_notification(self._rumble_callback)
+            except Exception as exc:
+                logger.warning("Could not register rumble callback: %s", exc)
 
         # Build button maps at runtime (vgamepad must be imported first)
         XUSB = _vg.XUSB_BUTTON
@@ -62,6 +74,23 @@ class XInputEmitter:
         ]
 
         logger.info("vgamepad VX360Gamepad created (slot %d)", slot)
+
+    # Required signature for vgamepad.register_notification
+    def _rumble_callback(self, _client, _target, large_motor, small_motor,
+                         _led_number, _user_data) -> None:
+        """ViGEmBus rumble notification — called from a C callback thread."""
+        left  = max(0, min(255, int(large_motor)))
+        right = max(0, min(255, int(small_motor)))
+        with self._rumble_lock:
+            if (left, right) == self._last_rumble:
+                return
+            self._last_rumble = (left, right)
+            cb = self._on_rumble
+        if cb is not None:
+            try:
+                cb(left, right)
+            except Exception as exc:
+                logger.debug("on_rumble callback error: %s", exc)
 
     def attach(self) -> bool:
         """Called by BridgeApp to confirm the controller is ready."""
@@ -116,6 +145,11 @@ class XInputEmitter:
             pad.update()
         except Exception as exc:
             logger.warning("vgamepad update error: %s", exc)
+
+    def last_rumble(self) -> tuple[int, int]:
+        """Return the most recent (left, right) motor speeds seen."""
+        with self._rumble_lock:
+            return self._last_rumble
 
     def detach(self) -> None:
         """Release resources."""

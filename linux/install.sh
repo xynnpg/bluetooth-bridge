@@ -72,8 +72,12 @@ if ! command -v curl &>/dev/null; then
     exit 1
 fi
 
-# ── 2. Windows IP ─────────────────────────────────────────────────────────────
+# ── 2. Configuration Prompts ──────────────────────────────────────────────────
 
+echo -e "${BOLD}Configure Bluetooth Bridge Settings:${RESET}"
+echo ""
+
+# Windows IP Address
 if [[ -n "${1:-}" ]]; then
     PC_HOST="$1"
     success "Using Windows IP from command line: $PC_HOST"
@@ -81,23 +85,52 @@ elif [[ -n "${PC_HOST:-}" ]]; then
     PC_HOST="$PC_HOST"
     success "Using Windows IP from environment: $PC_HOST"
 else
-    # Auto-detect and verify
-    DEFAULT_IP=$(ip route | grep default | awk '{print $3}' | head -1)
-    info "Default network gateway: $DEFAULT_IP"
-    echo ""
-    echo -n "Enter your Windows PC's IP address${DEFAULT_IP:+. (default: $DEFAULT_IP): }: "
-    read -r PC_HOST
-    PC_HOST="${PC_HOST:-$DEFAULT_IP}"
+    DEFAULT_IP=$(ip route | grep default | awk '{print $3}' | head -1 || true)
+    if [[ -n "$DEFAULT_IP" ]]; then
+        info "Detected network gateway: $DEFAULT_IP"
+    fi
+    read -r -p "Enter Windows PC IP address${DEFAULT_IP:+. (e.g. $DEFAULT_IP)}: " PC_INPUT
+    PC_HOST="${PC_INPUT:-$DEFAULT_IP}"
 fi
 
 PC_HOST="${PC_HOST:-}"
 if [[ -z "$PC_HOST" ]]; then
-    err "No Windows IP address set. Run again with:"
-    err "  curl -fsSL $REPO_BASE/install.sh | bash -s 192.168.1.101"
+    err "No Windows IP address provided."
+    info "Run again with: curl -fsSL $REPO_BASE/linux/install.sh | bash -s <WINDOWS_IP> [CONTROLLER_MAC]"
     exit 1
 fi
+success "Windows IP set to: $PC_HOST:$EXTERNAL_PORT"
 
-success "Windows IP: $PC_HOST:$EXTERNAL_PORT"
+# Controller MAC Address
+if [[ -n "${2:-}" ]]; then
+    CONTROLLER_MAC="$2"
+    success "Using Controller MAC from command line: $CONTROLLER_MAC"
+elif [[ -n "${CONTROLLER_MAC:-}" ]]; then
+    CONTROLLER_MAC="$CONTROLLER_MAC"
+    success "Using Controller MAC from environment: $CONTROLLER_MAC"
+else
+    DETECTED_MAC=""
+    if command -v bluetoothctl &>/dev/null; then
+        DETECTED_MAC=$(bluetoothctl devices 2>/dev/null | grep -i "Xbox" | awk '{print $2}' | head -1 || true)
+    fi
+
+    echo ""
+    if [[ -n "$DETECTED_MAC" ]]; then
+        info "Found paired Xbox Controller: $DETECTED_MAC"
+        read -r -p "Enter Controller MAC address [press Enter to use $DETECTED_MAC]: " MAC_INPUT
+        CONTROLLER_MAC="${MAC_INPUT:-$DETECTED_MAC}"
+    else
+        info "Enter your Xbox Controller's Bluetooth MAC address (e.g. 44:16:22:15:A1:31)."
+        info "(Leave blank to auto-detect any connected Xbox controller at runtime)"
+        read -r -p "Controller MAC address [optional]: " CONTROLLER_MAC
+    fi
+fi
+
+if [[ -n "$CONTROLLER_MAC" ]]; then
+    success "Controller MAC set to: $CONTROLLER_MAC"
+else
+    info "Controller MAC: (auto-discover at runtime)"
+fi
 
 # ── 3. Create install directory ───────────────────────────────────────────────
 
@@ -140,6 +173,7 @@ services:
       - /var/run/dbus:/var/run/dbus:ro
       - /run/dbus:/run/dbus:ro
       - /dev/input:/dev/input:ro
+      - /dev/hidraw:/dev/hidraw:ro
     env_file:
       - .env
 YML
