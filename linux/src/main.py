@@ -19,9 +19,12 @@ import sys
 import threading
 import time
 
-from .bluetooth import ensure_paired
+import evdev
+
+from .bluetooth import ensure_paired, get_battery_pct
 from .controller import (
-    PAYLOAD_SIZE, build_abs_info, find_controller, make_state, read_next_state,
+    PAYLOAD_SIZE, BATTERY_UNKNOWN, build_abs_info, find_controller,
+    make_state, read_next_state,
 )
 from .discovery import DiscoveryListener
 from .network import TCPStreamer
@@ -43,6 +46,8 @@ class BridgeApp:
         self._last_rumble = (0, 0)
         self._start_time = time.monotonic()
         self._bt_thread: threading.Thread | None = None
+        self._battery_thread: threading.Thread | None = None
+        self._battery_state_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -66,6 +71,16 @@ class BridgeApp:
         # 3 — Start TCP streamer
         self._tcp = TCPStreamer(pc_host, pc_port, on_disconnect=self._on_disconnect)
         self._tcp.start()
+
+        # 3b — Battery poller (background thread, 1 Hz).
+        # Many kernels don't surface battery state via EV_MSC, so we also
+        # poll `bluetoothctl info` as a reliable fallback.
+        self._battery_thread = threading.Thread(
+            target=self._battery_poll_loop,
+            name="BatteryPoller",
+            daemon=True,
+        )
+        self._battery_thread.start()
 
         # 4 — Main poll loop
         logger.info("Bridge running — press Ctrl+C to stop")
@@ -106,6 +121,17 @@ class BridgeApp:
                     self._state.controller_name = self._device.name or ""
                 logger.info("Controller device: %s (%s)",
                             self._device.path, self._device.name)
+                # Log whether the device exposes EV_MSC so users can see why
+                # battery is or isn't coming through that path.
+                try:
+                    caps = self._device.capabilities()
+                    has_msc = evdev.ecodes.EV_MSC in caps
+                    logger.info("EV_MSC available: %s (battery will %s)",
+                                has_msc,
+                                "use MSC events" if has_msc
+                                else "fall back to bluetoothctl polling")
+                except Exception:
+                    pass
                 self._open_rumble()
                 return
             except RuntimeError:
@@ -157,6 +183,37 @@ class BridgeApp:
         self._last_rumble = (rl, rr)
         with self._rumble_lock:
             self._rumble.apply(rl, rr)
+
+    def _battery_poll_loop(self) -> None:
+        """Background poller for `bluetoothctl info` battery readings.
+
+        Runs at 1 Hz. Only updates state.battery when the kernel MSC path
+        hasn't already provided a value (it has higher priority because
+        it's event-driven, lower latency, and reports charging state).
+        """
+        mac = self._controller_mac
+        if not mac:
+            # No MAC → we can't ask bluetoothctl anything useful
+            return
+        # Give the BT subsystem a moment to settle after connect
+        time.sleep(2.0)
+        while self._running:
+            try:
+                result = get_battery_pct(mac)
+                if result is not None:
+                    pct, charging = result
+                    state = self._state
+                    if state is None:
+                        time.sleep(1.0)
+                        continue
+                    # Only apply if MSC hasn't already given us a value
+                    with self._battery_state_lock:
+                        if state.battery == BATTERY_UNKNOWN:
+                            state.battery = pct
+                        state.charging = state.charging or charging
+            except Exception as exc:
+                logger.debug("battery poll error: %s", exc)
+            time.sleep(1.0)
 
     def _reconnect_device(self) -> None:
         logger.info("Attempting to re-open controller device …")

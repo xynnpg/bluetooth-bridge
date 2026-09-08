@@ -45,7 +45,11 @@ class XInputEmitter:
         # rumble commands reach us. The callback signature is fixed by vgamepad.
         if on_rumble is not None:
             try:
-                self._pad.register_notification(self._rumble_callback)
+                # Bind `self` as the first arg so the staticmethod matches
+                # the vgamepad-required signature.
+                import functools
+                bound = functools.partial(self._rumble_callback, self)
+                self._pad.register_notification(bound)
             except Exception as exc:
                 logger.warning("Could not register rumble callback: %s", exc)
 
@@ -75,17 +79,22 @@ class XInputEmitter:
 
         logger.info("vgamepad VX360Gamepad created (slot %d)", slot)
 
-    # Required signature for vgamepad.register_notification
-    def _rumble_callback(self, _client, _target, large_motor, small_motor,
-                         _led_number, _user_data) -> None:
+    # Required signature for vgamepad.register_notification.
+    # vgamepad does a strict `inspect.signature(callback) == signature(dummy_callback)`
+    # check, so this MUST be a staticmethod (bound methods include `self` in
+    # their signature and would fail the check). The instance reference is
+    # captured via the default-arg trick.
+    @staticmethod
+    def _rumble_callback(emitter, client, target, large_motor, small_motor,
+                         led_number, user_data):
         """ViGEmBus rumble notification — called from a C callback thread."""
         left  = max(0, min(255, int(large_motor)))
         right = max(0, min(255, int(small_motor)))
-        with self._rumble_lock:
-            if (left, right) == self._last_rumble:
+        with emitter._rumble_lock:
+            if (left, right) == emitter._last_rumble:
                 return
-            self._last_rumble = (left, right)
-            cb = self._on_rumble
+            emitter._last_rumble = (left, right)
+            cb = emitter._on_rumble
         if cb is not None:
             try:
                 cb(left, right)

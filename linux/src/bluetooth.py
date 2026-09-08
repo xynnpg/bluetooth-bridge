@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import time
 
@@ -124,6 +125,54 @@ def disconnect(mac: str) -> bool:
     """Disconnect a device."""
     result = _runctl(["disconnect", mac])
     return result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Battery polling (fallback for kernels that don't emit MSC_INPUT events)
+# ---------------------------------------------------------------------------
+
+_BATTERY_RE = re.compile(
+    r"Battery\s*Percentage\s*[:=]?\s*\(?0x[\da-f]+\)?\s*\(?\s*(\d+)\s*%\s*\)?",
+    re.IGNORECASE,
+)
+# More permissive pattern — matches lines like:
+#   Battery Percentage: 0x05 (5%)
+#   Battery Level: 87
+_BATTERY_RE_LOOSE = re.compile(
+    r"[Bb]attery[^:\n]*[:=]\s*(?:0x[\da-f]+\s*)?\(?(\d{1,3})\s*%?",
+)
+
+
+def get_battery_pct(mac: str) -> tuple[int, bool] | None:
+    """Return (percentage, charging) by parsing `bluetoothctl info <MAC>`.
+
+    Returns None if the info is not available. This is a slow poll
+    (one shell-out per call, ~200 ms) — only call it at 1 Hz from a
+    background thread, not on the hot evdev path.
+    """
+    try:
+        result = _runctl(["info", mac])
+    except Exception as exc:
+        logger.debug("bluetoothctl info failed: %s", exc)
+        return None
+    if result.returncode != 0:
+        return None
+    text = result.stdout or ""
+
+    pct = None
+    m = _BATTERY_RE.search(text) or _BATTERY_RE_LOOSE.search(text)
+    if m:
+        try:
+            pct = max(0, min(100, int(m.group(1))))
+        except ValueError:
+            pct = None
+    if pct is None:
+        return None
+
+    # "Charging" detection — bluetoothctl doesn't expose this on most stacks,
+    # so we fall back to "charging if a power supply is mentioned"
+    charging = bool(re.search(r"charging|power\s*supply", text, re.IGNORECASE))
+    return pct, charging
 
 
 def ensure_paired(mac: str | None = None) -> str:
