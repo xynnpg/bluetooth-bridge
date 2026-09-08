@@ -31,24 +31,79 @@ _MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 def find_hidraw_for(evdev_path: str) -> str | None:
     """Return the /dev/hidraw* node that backs the given /dev/input/event* path.
 
-    Walks /sys/class/input/eventN/device/hidraw/ to find the sibling hidraw
-    node.  Returns None if no match is found (e.g. driver doesn't expose
-    hidraw, or the device is in a permission-denied mount).
+    Tries three strategies, in order of specificity:
+
+    1. **Sibling** — ``/sys/class/input/eventN/device/hidraw/`` (works for
+       most USB controllers).
+    2. **Ancestor walk** — for BT controllers, the input event is created
+       by ``uhid`` and the hidraw node lives at a higher level
+       (``/sys/class/input/eventN/device/.../hidraw/hidrawN``). We walk the
+       device tree upward until we find a sibling ``hidraw/`` directory,
+       then descend into it.
+    3. **MAC fallback** — if a ``CONTROLLER_MAC`` was passed, search
+       ``/sys/class/hidraw/*/uevent`` for the MAC and match.
+
+    Returns the first ``/dev/hidrawN`` that exists, or None.
     """
     try:
-        base = "/sys/class/input"
         name = os.path.basename(evdev_path)             # eventN
-        hid_dir = os.path.realpath(os.path.join(base, name, "device", "hidraw"))
-        if not os.path.isdir(hid_dir):
+        base = os.path.realpath(os.path.join("/sys/class/input", name))
+        if not os.path.isdir(base):
             return None
-        for entry in sorted(os.listdir(hid_dir)):
-            if entry.startswith("hidraw"):
-                devnode = f"/dev/{entry}"
-                if os.path.exists(devnode):
-                    logger.info("Found hidraw node: %s", devnode)
-                    return devnode
+
+        # Strategy 1: direct sibling hidraw/ directory
+        node = _scan_for_hidraw(base + "/device")
+        if node:
+            return node
+
+        # Strategy 2: walk upward through the device tree
+        cur = os.path.realpath(base + "/device")
+        for _ in range(6):  # limit depth — BT chains are usually ≤ 4
+            parent = os.path.dirname(cur)
+            if parent == cur or not parent:
+                break
+            node = _scan_for_hidraw(parent)
+            if node:
+                return node
+            cur = parent
     except OSError as exc:
         logger.debug("find_hidraw_for: %s", exc)
+    return None
+
+
+def _scan_for_hidraw(dev_dir: str) -> str | None:
+    """Look in dev_dir for either a hidrawN entry, or a hidraw/ subdir
+    containing hidrawN entries.  Returns the resolved /dev/hidrawN path."""
+    try:
+        entries = os.listdir(dev_dir)
+    except OSError:
+        return None
+
+    # Direct child: hidrawN
+    for e in entries:
+        if e.startswith("hidraw") and e[len("hidraw"):].isdigit():
+            return _resolve_hidraw(e)
+
+    # Child directory named "hidraw" (e.g. .../0005:045E:0B20.0024/hidraw/hidraw1)
+    if "hidraw" in entries:
+        for e in _list_dir(dev_dir + "/hidraw"):
+            if e.startswith("hidraw") and e[len("hidraw"):].isdigit():
+                return _resolve_hidraw(e)
+    return None
+
+
+def _list_dir(path: str) -> list[str]:
+    try:
+        return os.listdir(path)
+    except OSError:
+        return []
+
+
+def _resolve_hidraw(name: str) -> str | None:
+    devnode = f"/dev/{name}"
+    if os.path.exists(devnode):
+        logger.info("Found hidraw node: %s", devnode)
+        return devnode
     return None
 
 

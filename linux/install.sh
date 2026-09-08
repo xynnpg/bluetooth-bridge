@@ -169,11 +169,25 @@ services:
     restart: unless-stopped
     network_mode: host
     privileged: true
+    # /dev/input and /dev/hidraw are mounted both as directory binds
+    # (so any new device nodes created by udev after start are visible)
+    # and as explicit device binds (so the controller's hidraw node is
+    # always present, even before the device shows up). Rumble will
+    # silently no-op if no node exists for the controller.
     volumes:
       - /var/run/dbus:/var/run/dbus:ro
       - /run/dbus:/run/dbus:ro
       - /dev/input:/dev/input:ro
       - /dev/hidraw:/dev/hidraw:ro
+    devices:
+      - /dev/hidraw0:/dev/hidraw0:rwm
+      - /dev/hidraw1:/dev/hidraw1:rwm
+      - /dev/hidraw2:/dev/hidraw2:rwm
+      - /dev/hidraw3:/dev/hidraw3:rwm
+      - /dev/hidraw4:/dev/hidraw4:rwm
+      - /dev/hidraw5:/dev/hidraw5:rwm
+      - /dev/hidraw6:/dev/hidraw6:rwm
+      - /dev/hidraw7:/dev/hidraw7:rwm
     env_file:
       - .env
 YML
