@@ -99,12 +99,32 @@ def find_xbox_device(devices: dict[str, str]) -> str | None:
 
 
 def pair(mac: str) -> bool:
-    """Pair with a device by MAC."""
+    """Pair with a device by MAC.
+
+    Returns True if pairing succeeded OR the device was already paired
+    (which is the common case when the controller has been paired with
+    this adapter before — bluetoothctl returns non-zero for the "already
+    paired" path). We never want this to block bridge startup.
+    """
     logger.info("Pairing with %s …", mac)
-    result = _runctl(["pair", mac])
-    if result.returncode != 0:
-        logger.error("Pairing failed: %s", result.stderr)
+    try:
+        result = _runctl(["pair", mac], timeout=5.0)
+    except subprocess.TimeoutExpired:
+        logger.warning("Pair to %s timed out — assuming already paired", mac)
+        return True
+    except Exception as exc:
+        logger.warning("Pair to %s failed: %s", mac, exc)
         return False
+    if result.returncode != 0:
+        msg = (result.stderr or "").strip() or (result.stdout or "").strip()
+        # BlueZ returns "Device already paired" — not an error for us
+        if "already" in msg.lower():
+            logger.info("Device %s already paired", mac)
+            return True
+        logger.warning("Pairing result: %s", msg)
+        # Return True anyway — if the controller is visible AND connect
+        # works, we're fine. A failed pair here is not fatal.
+        return True
     logger.info("Paired with %s", mac)
     return True
 
@@ -200,7 +220,7 @@ def ensure_paired(mac: str | None = None) -> str:
     if mac and len(mac) == 17:
         # Still need to start the BT service
         start_bluetooth_service()
-        _runctl(["connect", mac])
+        connect(mac)  # tolerant of timeouts — uses 5s timeout internally
         return mac.lower()
 
     start_bluetooth_service()

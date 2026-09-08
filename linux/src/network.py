@@ -54,7 +54,7 @@ class TCPStreamer:
     # ------------------------------------------------------------------
 
     def send(self, data: bytes) -> bool:
-        """Send a 24-byte controller state packet. Thread-safe."""
+        """Send a 54-byte controller state packet. Thread-safe."""
         if len(data) != _PAYLOAD_SIZE:
             raise ValueError(f"Payload must be {_PAYLOAD_SIZE} bytes, got {len(data)}")
 
