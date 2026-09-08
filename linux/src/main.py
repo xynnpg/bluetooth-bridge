@@ -164,6 +164,10 @@ class BridgeApp:
     # ------------------------------------------------------------------
 
     def _poll(self) -> None:
+        # Skip until the device is open (during reconnect retries)
+        if self._device is None or self._state is None:
+            time.sleep(0.5)
+            return
         try:
             state = read_next_state(self._device, self._abs_info, self._state)
             # Apply host-driven rumble to the controller
@@ -174,6 +178,11 @@ class BridgeApp:
             time.sleep(0.5)
         except OSError as exc:
             logger.error("Device read error: %s", exc)
+            self._reconnect_device()
+        except AttributeError as exc:
+            # Device handle vanished (e.g. controller was unplugged) — treat
+            # as a transient reconnect situation rather than a fatal crash.
+            logger.error("Device handle lost: %s — will reconnect", exc)
             self._reconnect_device()
 
     def _maybe_rumble(self, state) -> None:
@@ -190,15 +199,19 @@ class BridgeApp:
         Runs at 1 Hz. Only updates state.battery when the kernel MSC path
         hasn't already provided a value (it has higher priority because
         it's event-driven, lower latency, and reports charging state).
+
+        If no MAC is configured, we auto-discover one by reading
+        `bluetoothctl devices` and matching on "xbox" / "controller".
         """
-        mac = self._controller_mac
-        if not mac:
-            # No MAC → we can't ask bluetoothctl anything useful
-            return
         # Give the BT subsystem a moment to settle after connect
         time.sleep(2.0)
+        cached_mac = (self._controller_mac or "").lower()
         while self._running:
             try:
+                mac = cached_mac or self._discover_xbox_mac()
+                if not mac:
+                    time.sleep(2.0)
+                    continue
                 result = get_battery_pct(mac)
                 if result is not None:
                     pct, charging = result
@@ -209,32 +222,75 @@ class BridgeApp:
                     # Only apply if MSC hasn't already given us a value
                     with self._battery_state_lock:
                         if state.battery == BATTERY_UNKNOWN:
+                            logger.info("Battery %d%% (bluetoothctl fallback)",
+                                        pct)
                             state.battery = pct
                         state.charging = state.charging or charging
+                        if mac and not state.controller_mac:
+                            state.controller_mac = mac
             except Exception as exc:
                 logger.debug("battery poll error: %s", exc)
             time.sleep(1.0)
 
+    def _discover_xbox_mac(self) -> str:
+        """Find a paired Xbox controller MAC via `bluetoothctl devices`.
+
+        Returns "" if no Xbox device is found. Result is cached.
+        """
+        try:
+            from .bluetooth import _runctl
+            r = _runctl(["devices"], timeout=3.0)
+            if r.returncode != 0:
+                return ""
+            for line in (r.stdout or "").splitlines():
+                parts = line.split(maxsplit=2)
+                if len(parts) >= 3 and len(parts[1]) == 17:
+                    name = parts[2].lower()
+                    if any(k in name for k in ("xbox", "controller", "microsoft")):
+                        return parts[1].lower()
+        except Exception as exc:
+            logger.debug("discover_xbox_mac: %s", exc)
+        return ""
+
     def _reconnect_device(self) -> None:
+        """Re-open the controller device, retrying until it reappears.
+
+        This is invoked from the main poll loop and intentionally blocks —
+        the main loop's `_poll` will simply skip iterations while
+        ``self._device`` is None, so we keep trying in the background
+        instead of crashing the whole bridge.
+        """
         logger.info("Attempting to re-open controller device …")
         with self._rumble_lock:
             self._rumble.close()
         self._device = None
-        for _ in range(30):
+        self._state  = None
+        attempt = 0
+        while self._running:
+            attempt += 1
             try:
-                self._device = find_controller()
-                self._abs_info = build_abs_info(self._device)
-                self._state = make_state(self._device, self._abs_info)
-                if self._state is not None:
-                    self._state.controller_mac = self._controller_mac or ""
-                    self._state.controller_name = self._device.name or ""
-                logger.info("Controller reconnected at %s", self._device.path)
+                dev = find_controller()
+                self._abs_info = build_abs_info(dev)
+                new_state = make_state(dev, self._abs_info)
+                if new_state is not None:
+                    new_state.controller_mac  = self._controller_mac or ""
+                    new_state.controller_name = dev.name or ""
+                self._device = dev
+                self._state  = new_state
+                logger.info("Controller reconnected at %s (attempt %d)",
+                            dev.path, attempt)
                 self._open_rumble()
                 return
             except RuntimeError:
                 pass
-            time.sleep(1)
-        logger.error("Could not re-find controller device")
+            except Exception as exc:
+                logger.debug("reconnect attempt %d failed: %s", attempt, exc)
+            time.sleep(2)
+            if attempt % 15 == 0:
+                logger.warning(
+                    "Still waiting for controller device (%d s elapsed)…",
+                    attempt * 2,
+                )
 
     def _on_disconnect(self) -> None:
         logger.warning("Connection to PC lost — will auto-reconnect")

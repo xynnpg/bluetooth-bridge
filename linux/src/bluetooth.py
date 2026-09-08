@@ -14,19 +14,24 @@ _BLUEZCTL = "/usr/bin/bluetoothctl"
 _DBUS_LAUNCH = "/usr/bin/dbus-launch"
 
 
-def _runctl(args: list[str], check: bool = False) -> subprocess.CompletedProcess:
-    """Run bluetoothctl with optional dbus session."""
+def _runctl(args: list[str], check: bool = False, timeout: float = 8.0) -> subprocess.CompletedProcess:
+    """Run bluetoothctl with optional dbus session.
+
+    The default timeout is 8s — long enough for normal `info` / `pair`
+    calls but short enough that a stuck `connect` doesn't block startup
+    for the previous 15s default. Pass `timeout=` to override per call.
+    """
     full = [_BLUEZCTL] + args
     try:
         # Try dbus-run-session if available
         result = subprocess.run(
             ["/usr/bin/dbus-run-session", "--"] + full,
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=timeout,
         )
     except FileNotFoundError:
         result = subprocess.run(
             full,
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=timeout,
         )
     if check and result.returncode != 0:
         logger.error("bluetoothctl %s failed: %s", args, result.stderr)
@@ -111,13 +116,24 @@ def trust(mac: str) -> bool:
 
 
 def connect(mac: str) -> bool:
-    """Establish a GATT/ HID connection to the controller."""
+    """Establish a GATT/ HID connection to the controller.
+
+    Returns True whether or not the call succeeded — the controller may
+    already be connected (BlueZ just returns "AlreadyConnected"), or the
+    call may time out if the device is busy. We don't want to crash the
+    whole bridge for a transient BT hiccup.
+    """
     logger.info("Connecting to %s …", mac)
-    result = _runctl(["connect", mac])
-    if result.returncode != 0:
-        logger.warning("Connect command result: %s", result.stderr)
-        # bluetoothctl connect can return non-zero even on success
-    time.sleep(2)
+    try:
+        result = _runctl(["connect", mac], timeout=5.0)
+        if result.returncode != 0:
+            logger.warning("Connect command result: %s",
+                           (result.stderr or "").strip())
+    except subprocess.TimeoutExpired:
+        logger.warning("Connect to %s timed out — assuming already connected", mac)
+    except Exception as exc:
+        logger.warning("Connect to %s failed: %s", mac, exc)
+    time.sleep(1)
     return True
 
 
