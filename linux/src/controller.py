@@ -25,8 +25,8 @@ NAME_FIELD_LEN  = 16
 _BTN_MAP: dict[int, int] = {
     evdev.ecodes.BTN_SOUTH:  0,  # A
     evdev.ecodes.BTN_EAST:   1,  # B
-    evdev.ecodes.BTN_NORTH:  2,  # X
-    evdev.ecodes.BTN_WEST:   3,  # Y
+    evdev.ecodes.BTN_WEST:   2,  # X
+    evdev.ecodes.BTN_NORTH:  3,  # Y
     evdev.ecodes.BTN_TL:     4,  # LB
     evdev.ecodes.BTN_TR:     5,  # RB
     evdev.ecodes.BTN_SELECT: 6,  # View / Back
