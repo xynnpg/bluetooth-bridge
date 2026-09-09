@@ -195,24 +195,30 @@ class BridgeApp:
             self._rumble.apply(rl, rr)
 
     _debug_last_log = 0.0
+    _debug_last_buttons = (0, 0, 0)
 
     def _debug_log_state(self, state) -> None:
-        """At 1 Hz, log buttons_low/high and dpad as hex. Helps diagnose
+        """Log buttons_low/high/dpad whenever they change. Helps diagnose
         "buttons don't work" — if the bits ARE being captured here, the
-        problem is on the Windows side; if they aren't, it's the kernel."""
+        problem is on the Windows side; if they aren't, it's the kernel.
+
+        Throttled to 1 Hz when steady, but a transition log fires immediately."""
         now = time.monotonic()
+        cur = (state.buttons_low & 0xFF, state.buttons_high & 0xFF, state.dpad & 0xFF)
+        if cur != self._debug_last_buttons:
+            logger.info("button change: bl=0x%02x bh=0x%02x dpad=0x%02x",
+                        cur[0], cur[1], cur[2])
+            self._debug_last_buttons = cur
+            self._debug_last_log = now
+            return
         if now - self._debug_last_log < 1.0:
             return
         self._debug_last_log = now
-        if state.buttons_low or state.buttons_high or state.dpad:
-            logger.info(
-                "state: bl=0x%02x bh=0x%02x dpad=0x%02x rumble=(%d,%d) batt=%d%%",
-                state.buttons_low & 0xFF,
-                state.buttons_high & 0xFF,
-                state.dpad & 0xFF,
-                state.rumble_left, state.rumble_right,
-                state.battery,
-            )
+        if any(cur):
+            logger.info("state: bl=0x%02x bh=0x%02x dpad=0x%02x rumble=(%d,%d) batt=%d%%",
+                        cur[0], cur[1], cur[2],
+                        state.rumble_left, state.rumble_right,
+                        state.battery)
 
     def _battery_poll_loop(self) -> None:
         """Background poller for `bluetoothctl info` battery readings.
