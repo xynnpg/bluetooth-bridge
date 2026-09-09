@@ -203,8 +203,10 @@ class BridgeApp:
         problem is on the Windows side; if they aren't, it's the kernel.
 
         Throttled to 1 Hz when steady, but a transition log fires immediately."""
+        from .controller import _dpad_bitmask
         now = time.monotonic()
-        cur = (state.buttons_low & 0xFF, state.buttons_high & 0xFF, state.dpad & 0xFF)
+        dpad = _dpad_bitmask(state._hat_x, state._hat_y)
+        cur = (state.buttons_low & 0xFF, state.buttons_high & 0xFF, dpad & 0xFF)
         if cur != self._debug_last_buttons:
             logger.info("button change: bl=0x%02x bh=0x%02x dpad=0x%02x",
                         cur[0], cur[1], cur[2])
