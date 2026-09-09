@@ -2,11 +2,30 @@
 
 The Linux kernel's hid-microsoft driver exposes the controller's raw GATT
 characteristic through a `/dev/hidraw*` device. We open it in non-blocking
-mode and send the canonical 9-byte "Rumble" output report whenever the host
-(Windo we side) sets a new motor speed.
+mode and send the appropriate output report whenever the host (Windows
+side) sets a new motor speed.
 
-Report layout (Xbox One S / Series X|S over Bluetooth):
+Two report formats exist depending on the controller generation:
+
+* **Xbox One / 360 (older, 045E:02D1, 045E:02EA, 045E:02FD)**:
     0x09 0x00 0x00 0x09 0x00 0x0F <left> <right> 0x00 0x00 0x80 0x00 0x00
+    (13 bytes, report id 0x09)
+
+* **Xbox Wireless (model 1708 / 1797 / 1914, 045E:0B20 etc.)**:
+    struct xb1s_ff_report in drivers/hid/hid-microsoft.c:
+        uint8  report_id   = 0x03
+        uint8  enable      = 0x03 (ENABLE_WEAK | ENABLE_STRONG)
+        uint8  strong      ;  // left  actuator  (0..100 from FF_RUMBLE, but we use 0..255)
+        uint8  weak        ;  // right actuator
+        uint8  duration_10ms = 0xFF
+        uint8  start_delay_10ms = 0
+        uint8  loop_count  = 0xFF
+    (7 bytes, report id 0x03)
+
+We auto-detect the format by reading the controller's PRODUCT id at hidraw
+attach time. The default is the modern 7-byte format (works for any
+"Xbox Wireless Controller" with the "Wireless" name, which is what
+hid-microsoft.quirks list covers).
 """
 
 from __future__ import annotations
@@ -19,11 +38,16 @@ import struct
 
 logger = logging.getLogger("rumble")
 
-# Canonical Xbox One BT rumble output report (13 bytes).
-# Source: linux/drivers/hid/hid-microsoft.c + community reverse-engineering.
-_RUMBLE_REPORT = struct.Struct("<BBBBBBBBBBBBB")
-_RUMBLE_INIT   = bytes([0x09, 0x00, 0x00, 0x09, 0x00, 0x0F,
-                        0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00])
+# --- Xbox Wireless (model 1708, 1797, 1914) — 7-byte output report ----------
+# Layout from drivers/hid/hid-microsoft.c:
+#   report_id=0x03, enable=0x03, strong, weak, duration=0xFF, delay=0, loop=0xFF
+_WIRELESS_RUMBLE = struct.Struct("<BBBBBBB")
+_WIRELESS_INIT   = bytes([0x03, 0x03, 0x00, 0x00, 0xFF, 0x00, 0xFF])
+
+# --- Xbox One original (045E:02D1 / 02EA / 02FD) — 13-byte output report ----
+_ONE_RUMBLE = struct.Struct("<BBBBBBBBBBBBB")
+_ONE_INIT   = bytes([0x09, 0x00, 0x00, 0x09, 0x00, 0x0F,
+                     0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00])
 
 _MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 
@@ -136,6 +160,12 @@ class RumbleWriter:
         self._path = hidraw_path
         self._fd: int | None = None
         self._last = (-1, -1)
+        # 'wireless' = 7-byte report (0x03, model 1708+); 'one' = 13-byte
+        # legacy (0x09, model 1697 / original Xbox One).
+        self._format: str = "wireless"
+        self._wireless = _WIRELESS_RUMBLE
+        self._one = _ONE_RUMBLE
+        self._init_pkt: bytes = _WIRELESS_INIT
 
     def set_device(self, hidraw_path: str) -> None:
         """(Re-)open the hidraw node. Safe to call after a controller reconnect."""
@@ -143,7 +173,54 @@ class RumbleWriter:
             return
         self.close()
         self._path = hidraw_path
+        self._detect_format()
         self._open()
+
+    def _detect_format(self) -> None:
+        """Pick the rumble output-report format based on the controller's
+        PRODUCT id (from the hidraw device's parent). For model 1708/1797/
+        1914 (XBOX Wireless) we use the 7-byte report; for older Xbox One
+        controllers (model 1697 / 1707 / PID 0x02D1 / 02EA / 02FD) we fall
+        back to the legacy 13-byte report.
+
+        We don't fail the bridge if we can't tell — the wireless format is
+        the safe modern default.
+        """
+        try:
+            base = os.path.realpath(os.path.join(
+                "/sys/class/hidraw", os.path.basename(self._path or ""),
+                "device"))
+            for _ in range(6):
+                modalias = os.path.join(base, "modalias")
+                if os.path.exists(modalias):
+                    with open(modalias, encoding="ascii") as f:
+                        text = f.read()
+                    # modalias format examples:
+                    #   hid:b0005g0001v0000045Ep00000B20
+                    #   bluetooth:0005v045Ep0B20e0521
+                    # We just need to find a 4-hex-digit PID adjacent to p.
+                    import re as _re
+                    m = _re.search(r"v[\dA-Fa-f]{4}p([0-9A-Fa-f]{4})", text)
+                    if m:
+                        pid = int(m.group(1), 16)
+                        logger.debug("rumble: detected PID 0x%04x from %s",
+                                     pid, modalias)
+                        if pid in (0x02D1, 0x02EA, 0x02FD):
+                            self._format = "one"
+                            self._init_pkt = _ONE_INIT
+                            logger.info("Rumble format: legacy Xbox One (13-byte)")
+                            return
+                    # Found a modalias but no match → modern
+                    self._format = "wireless"
+                    self._init_pkt = _WIRELESS_INIT
+                    logger.info("Rumble format: Xbox Wireless (7-byte, default)")
+                    return
+                base = os.path.dirname(base)
+        except OSError as exc:
+            logger.debug("_detect_format: %s", exc)
+        # Couldn't determine — use modern default.
+        self._format = "wireless"
+        self._init_pkt = _WIRELESS_INIT
 
     def _open(self) -> None:
         if not self._path:
@@ -152,7 +229,7 @@ class RumbleWriter:
             self._fd = os.open(self._path, os.O_WRONLY | os.O_NONBLOCK)
             # Initialise motor state to zero (some controllers won't rumble
             # until the first report is sent after reconnect)
-            os.write(self._fd, _RUMBLE_INIT)
+            os.write(self._fd, self._init_pkt)
             self._last = (0, 0)
             logger.info("Rumble writer attached to %s", self._path)
         except OSError as exc:
@@ -173,11 +250,15 @@ class RumbleWriter:
 
         if self._fd is None:
             return
-        report = _RUMBLE_REPORT.pack(
-            0x09, 0x00, 0x00, 0x09, 0x00, 0x0F,
-            left,  right,
-            0x00, 0x00, 0x80, 0x00, 0x00,
-        )
+        if self._format == "one":
+            report = self._one.pack(
+                0x09, 0x00, 0x00, 0x09, 0x00, 0x0F,
+                left,  right,
+                0x00, 0x00, 0x80, 0x00, 0x00,
+            )
+        else:
+            # Xbox Wireless (model 1708+): 0x03, enable=0x03, strong, weak, 0xFF, 0, 0xFF
+            report = self._wireless.pack(0x03, 0x03, left, right, 0xFF, 0x00, 0xFF)
         try:
             os.write(self._fd, report)
         except OSError as exc:
@@ -194,7 +275,7 @@ class RumbleWriter:
         """Stop rumble and release the file descriptor."""
         if self._fd is not None:
             try:
-                os.write(self._fd, _RUMBLE_INIT)
+                os.write(self._fd, self._init_pkt)
             except OSError:
                 pass
             try:
