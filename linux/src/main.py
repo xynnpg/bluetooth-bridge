@@ -40,6 +40,7 @@ class BridgeApp:
         self._device = None
         self._abs_info: dict = {}
         self._state = None          # persistent ControllerState
+        self._state_lock = threading.Lock()  # protects rumble_left/right
         self._controller_mac = os.getenv("CONTROLLER_MAC", "").strip() or None
         self._rumble = RumbleWriter()
         self._rumble_lock = threading.Lock()
@@ -69,7 +70,11 @@ class BridgeApp:
         self._open_device()
 
         # 3 — Start TCP streamer
-        self._tcp = TCPStreamer(pc_host, pc_port, on_disconnect=self._on_disconnect)
+        self._tcp = TCPStreamer(
+            pc_host, pc_port,
+            on_disconnect=self._on_disconnect,
+            on_recv_packet=self._on_recv_packet,
+        )
         self._tcp.start()
 
         # 3b — Battery poller (background thread, 1 Hz).
@@ -81,6 +86,18 @@ class BridgeApp:
             daemon=True,
         )
         self._battery_thread.start()
+
+        # 3c — Rumble apply thread (20 Hz).
+        # The main _poll loop only runs when the controller generates input
+        # events, so it cannot service rumble commands while the user isn't
+        # touching the controller.  This thread polls state.rumble_left/right
+        # at 20 Hz and forwards changes to the controller's motors.
+        self._rumble_thread = threading.Thread(
+            target=self._rumble_apply_loop,
+            name="RumbleApply",
+            daemon=True,
+        )
+        self._rumble_thread.start()
 
         # 4 — Main poll loop
         logger.info("Bridge running — press Ctrl+C to stop")
@@ -191,12 +208,50 @@ class BridgeApp:
             logger.warning("Poll iteration error (swallowed): %s", exc)
 
     def _maybe_rumble(self, state) -> None:
-        rl, rr = state.rumble_left, state.rumble_right
+        with self._state_lock:
+            rl, rr = state.rumble_left, state.rumble_right
         if (rl, rr) == self._last_rumble:
             return
         self._last_rumble = (rl, rr)
         with self._rumble_lock:
             self._rumble.apply(rl, rr)
+
+    def _rumble_apply_loop(self) -> None:
+        """20 Hz loop that applies rumble values from the shared state.
+
+        Runs independent of _poll so that rumble commands received while
+        the controller is idle still reach the motors.  Without this, a
+        user who isn't pressing buttons would never feel vibration.
+        """
+        while self._running:
+            try:
+                if self._state is not None:
+                    with self._state_lock:
+                        rl, rr = self._state.rumble_left, self._state.rumble_right
+                    if (rl, rr) != self._last_rumble:
+                        self._last_rumble = (rl, rr)
+                        with self._rumble_lock:
+                            self._rumble.apply(rl, rr)
+            except Exception as exc:
+                logger.debug("rumble_apply_loop: %s", exc)
+            time.sleep(0.05)  # 20 Hz
+
+    def _on_recv_packet(self, packet: bytes) -> None:
+        """Handle a 54-byte v2 packet received from the Windows PC.
+
+        The PC sends back the same packet structure it receives, with
+        most fields zeroed and only the rumble bytes (offsets 16-17)
+        populated.  We update the shared state so the rumble-apply
+        thread picks the new values up and forwards them to the
+        controller's motors.
+        """
+        if len(packet) < 18:
+            return
+        with self._state_lock:
+            if self._state is None:
+                return
+            self._state.rumble_left  = packet[16]
+            self._state.rumble_right = packet[17]
 
     def _battery_poll_loop(self) -> None:
         """Background poller for `bluetoothctl info` battery readings.
