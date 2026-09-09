@@ -172,7 +172,6 @@ class BridgeApp:
             state = read_next_state(self._device, self._abs_info, self._state)
             # Apply host-driven rumble to the controller
             self._maybe_rumble(state)
-            self._debug_log_state(state)
             if self._tcp.send(state.to_bytes()):
                 return  # sent ok
             # If send failed, sleep and retry until reconnected
@@ -185,6 +184,11 @@ class BridgeApp:
             # as a transient reconnect situation rather than a fatal crash.
             logger.error("Device handle lost: %s — will reconnect", exc)
             self._reconnect_device()
+        except Exception as exc:
+            # Swallow unexpected errors so a transient bug doesn't tear down
+            # the device handle and drop queued events. Log at WARNING so it's
+            # visible but not alarming.
+            logger.warning("Poll iteration error (swallowed): %s", exc)
 
     def _maybe_rumble(self, state) -> None:
         rl, rr = state.rumble_left, state.rumble_right
@@ -193,34 +197,6 @@ class BridgeApp:
         self._last_rumble = (rl, rr)
         with self._rumble_lock:
             self._rumble.apply(rl, rr)
-
-    _debug_last_log = 0.0
-    _debug_last_buttons = (0, 0, 0)
-
-    def _debug_log_state(self, state) -> None:
-        """Log buttons_low/high/dpad whenever they change. Helps diagnose
-        "buttons don't work" — if the bits ARE being captured here, the
-        problem is on the Windows side; if they aren't, it's the kernel.
-
-        Throttled to 1 Hz when steady, but a transition log fires immediately."""
-        from .controller import _dpad_bitmask
-        now = time.monotonic()
-        dpad = _dpad_bitmask(state._hat_x, state._hat_y)
-        cur = (state.buttons_low & 0xFF, state.buttons_high & 0xFF, dpad & 0xFF)
-        if cur != self._debug_last_buttons:
-            logger.info("button change: bl=0x%02x bh=0x%02x dpad=0x%02x",
-                        cur[0], cur[1], cur[2])
-            self._debug_last_buttons = cur
-            self._debug_last_log = now
-            return
-        if now - self._debug_last_log < 1.0:
-            return
-        self._debug_last_log = now
-        if any(cur):
-            logger.info("state: bl=0x%02x bh=0x%02x dpad=0x%02x rumble=(%d,%d) batt=%d%%",
-                        cur[0], cur[1], cur[2],
-                        state.rumble_left, state.rumble_right,
-                        state.battery)
 
     def _battery_poll_loop(self) -> None:
         """Background poller for `bluetoothctl info` battery readings.
