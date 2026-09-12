@@ -38,11 +38,11 @@ import struct
 
 logger = logging.getLogger("rumble")
 
-# --- Xbox Wireless (model 1708, 1797, 1914) — 7-byte output report ----------
+# --- Xbox Wireless (model 1708, 1797, 1914) — 9-byte output report ----------
 # Layout from drivers/hid/hid-microsoft.c:
 #   report_id=0x03, enable=0x03, strong, weak, duration=0xFF, delay=0, loop=0xFF
-_WIRELESS_RUMBLE = struct.Struct("<BBBBBBB")
-_WIRELESS_INIT   = bytes([0x03, 0x03, 0x00, 0x00, 0xFF, 0x00, 0xFF])
+_WIRELESS_RUMBLE = struct.Struct("<BBBBBBBBB")
+_WIRELESS_INIT   = bytes([0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xFF])
 
 # --- Xbox One original (045E:02D1 / 02EA / 02FD) — 13-byte output report ----
 _ONE_RUMBLE = struct.Struct("<BBBBBBBBBBBBB")
@@ -160,7 +160,7 @@ class RumbleWriter:
         self._path = hidraw_path
         self._fd: int | None = None
         self._last = (-1, -1)
-        # 'wireless' = 7-byte report (0x03, model 1708+); 'one' = 13-byte
+        # 'wireless' = 9-byte report (0x03, model 1708+); 'one' = 13-byte
         # legacy (0x09, model 1697 / original Xbox One).
         self._format: str = "wireless"
         self._wireless = _WIRELESS_RUMBLE
@@ -179,7 +179,7 @@ class RumbleWriter:
     def _detect_format(self) -> None:
         """Pick the rumble output-report format based on the controller's
         PRODUCT id (from the hidraw device's parent). For model 1708/1797/
-        1914 (XBOX Wireless) we use the 7-byte report; for older Xbox One
+        1914 (XBOX Wireless) we use the 9-byte report; for older Xbox One
         controllers (model 1697 / 1707 / PID 0x02D1 / 02EA / 02FD) we fall
         back to the legacy 13-byte report.
 
@@ -213,7 +213,7 @@ class RumbleWriter:
                     # Found a modalias but no match → modern
                     self._format = "wireless"
                     self._init_pkt = _WIRELESS_INIT
-                    logger.info("Rumble format: Xbox Wireless (7-byte, default)")
+                    logger.info("Rumble format: Xbox Wireless (9-byte)")
                     return
                 base = os.path.dirname(base)
         except OSError as exc:
@@ -257,8 +257,11 @@ class RumbleWriter:
                 0x00, 0x00, 0x80, 0x00, 0x00,
             )
         else:
-            # Xbox Wireless (model 1708+): 0x03, enable=0x03, strong, weak, 0xFF, 0, 0xFF
-            report = self._wireless.pack(0x03, 0x03, left, right, 0xFF, 0x00, 0xFF)
+            strong = max(0, min(100, round(left  * 100 / 255)))
+            weak   = max(0, min(100, round(right * 100 / 255)))
+            report = self._wireless.pack(
+                0x03, 0x03, 0x00, 0x00, strong, weak, 0xFF, 0x00, 0xFF,
+            )
         try:
             os.write(self._fd, report)
         except OSError as exc:

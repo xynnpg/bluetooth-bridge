@@ -138,27 +138,17 @@ class BridgeApp:
                     self._state.controller_name = self._device.name or ""
                 logger.info("Controller device: %s (%s)",
                             self._device.path, self._device.name)
-                # Log whether the device exposes EV_MSC so users can see why
-                # battery is or isn't coming through that path.
-                try:
-                    caps = self._device.capabilities()
-                    has_msc = evdev.ecodes.EV_MSC in caps
-                    logger.info("EV_MSC available: %s (battery will %s)",
-                                has_msc,
-                                "use MSC events" if has_msc
-                                else "fall back to bluetoothctl polling")
-                except Exception:
-                    pass
                 self._open_rumble()
                 return
             except RuntimeError:
                 pass
             time.sleep(1)
 
-        raise RuntimeError(
-            "Controller device not found after 60 s. "
+        logger.error(
+            "Controller device not found after 60 s — will keep retrying. "
             "Ensure the controller is paired and powered on."
         )
+        self._reconnect_device()
 
     def _open_rumble(self) -> None:
         """Locate and open the hidraw node that backs the current evdev device."""

@@ -211,6 +211,16 @@ def get_battery_pct(mac: str) -> tuple[int, bool] | None:
     return pct, charging
 
 
+def _controller_present(mac: str) -> bool:
+    """Return True if bluetoothctl reports the device as Connected: yes."""
+    try:
+        result = _runctl(["info", mac], timeout=5.0)
+    except Exception:
+        return False
+    text = (result.stdout or "") + (result.stderr or "")
+    return "Connected: yes" in text
+
+
 def ensure_paired(mac: str | None = None) -> str:
     """Fully manage pairing: start BT, scan, findXbox, pair+trust, connect.
 
@@ -220,7 +230,15 @@ def ensure_paired(mac: str | None = None) -> str:
     if mac and len(mac) == 17:
         # Still need to start the BT service
         start_bluetooth_service()
-        connect(mac)  # tolerant of timeouts — uses 5s timeout internally
+        trust(mac)
+        # Retry connect a few times — the controller may still be waking up
+        # or the BT stack may be busy right after startup.
+        for attempt in range(1, 4):
+            connect(mac)
+            if _controller_present(mac):
+                return mac.lower()
+            logger.info("Controller not present yet (attempt %d/3) …", attempt)
+            time.sleep(2)
         return mac.lower()
 
     start_bluetooth_service()

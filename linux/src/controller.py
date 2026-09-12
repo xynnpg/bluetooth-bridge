@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import select
 import struct
 import time
 from dataclasses import dataclass, field
@@ -25,8 +26,8 @@ NAME_FIELD_LEN  = 16
 _BTN_MAP: dict[int, int] = {
     evdev.ecodes.BTN_SOUTH:  0,  # A
     evdev.ecodes.BTN_EAST:   1,  # B
-    evdev.ecodes.BTN_WEST:   2,  # X
-    evdev.ecodes.BTN_NORTH:  3,  # Y
+    evdev.ecodes.BTN_NORTH:  2,  # X
+    evdev.ecodes.BTN_WEST:   3,  # Y
     evdev.ecodes.BTN_TL:     4,  # LB
     evdev.ecodes.BTN_TR:     5,  # RB
     evdev.ecodes.BTN_SELECT: 6,  # View / Back
@@ -358,9 +359,21 @@ def read_next_state(
     axis values and button states carry over between event batches.
     """
     while True:
+        # Block on the fd instead of busy-spinning.  python-evdev opens the
+        # device with O_NONBLOCK, so read_one() returns None immediately and
+        # a naive loop pegs a full CPU core — which starves the TCP recv and
+        # rumble-apply threads and adds ~hundreds of ms of input/vibration
+        # latency.  select() parks the thread until an event is ready.
+        try:
+            ready, _, _ = select.select([device.fd], [], [], 1.0)
+        except (OSError, ValueError) as exc:
+            raise OSError(f"device select failed: {exc}")
+        if not ready:
+            continue  # 1s timeout — re-check _running / device state
+
         event = device.read_one()
         if event is None:
-            continue  # non-blocking — spin until data arrives
+            continue
 
         if event.type == evdev.ecodes.EV_SYN:
             # Only deliver on SYN_REPORT (code 0), skip SYN_DROPPED etc.
@@ -372,8 +385,6 @@ def read_next_state(
             _update_abs(state, event, abs_info)
         elif event.type == evdev.ecodes.EV_KEY:
             _update_key(state, event)
-        elif event.type == evdev.ecodes.EV_MSC:
-            _update_msc(state, event)
 
 
 # ---------------------------------------------------------------------------
@@ -484,41 +495,3 @@ def _update_key(state: ControllerState, event) -> None:
 
     # --- Unknown / unmapped — log so missing inputs are easy to identify ------
     logger.debug("KEY  code=%d val=%d (UNMAPPED)", code, val)
-
-
-# ---------------------------------------------------------------------------
-# Battery / charging (EV_MSC + ABS_MISC fallback)
-# ---------------------------------------------------------------------------
-
-# Battery levels per Xbox One Input Report spec
-# Source: https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/xbox-one-controller-input-report
-# Byte 14 of the 17-byte report:  (level << 4) | status
-#   level:  0=empty, 1=full, 2=medium, 3=low, 4=critical
-#   status: bit 0=connected, bit 1=charging
-_BATTERY_LEVEL_PCT = {0: 5, 1: 90, 2: 60, 3: 30, 4: 10}
-
-
-def _update_msc(state: ControllerState, event) -> None:
-    """Parse EV_MSC / MSC_INPUT for the Xbox One 17-byte input report.
-
-    The `hid-microsoft` driver pushes the full report through this event;
-    we extract battery level + charging from byte 14.
-    """
-    if event.code != evdev.ecodes.MSC_INPUT:
-        return
-    report = event.value
-    if not isinstance(report, (list, tuple)) or len(report) < 17:
-        return
-    if report[0] != 0x04:  # only the 0x04 "input" report carries battery
-        return
-    flags  = report[14]
-    level  = (flags >> 4) & 0x0F
-    charge = bool(flags & 0x02)   # bit 1 = charging
-    pct    = _BATTERY_LEVEL_PCT.get(level)
-    if pct is None:
-        return
-    old_b, old_c = state.battery, state.charging
-    state.battery  = pct
-    state.charging = charge
-    if (old_b, old_c) != (pct, charge):
-        logger.info("Battery %d%% charging=%s", pct, charge)
