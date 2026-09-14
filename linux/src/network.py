@@ -84,18 +84,22 @@ class TCPStreamer:
         if len(data) != _PAYLOAD_SIZE:
             raise ValueError(f"Payload must be {_PAYLOAD_SIZE} bytes, got {len(data)}")
 
+        # The lock must be held across the ENTIRE sendall(), not just while
+        # reading self._sock.  The keepalive thread also writes to this
+        # socket; if a partial sendall() under congestion interleaves with
+        # a PING packet, the byte stream is permanently misaligned and the
+        # Windows receiver can false-re-sync onto garbage (ghost inputs).
         with self._lock:
             sock = self._sock
-        if sock is None:
-            return False
-
-        try:
-            sock.sendall(data)
-            return True
-        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
-            logger.warning("Send failed: %s", exc)
-            self._mark_disconnected()
-            return False
+            if sock is None:
+                return False
+            try:
+                sock.sendall(data)
+                return True
+            except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+                logger.warning("Send failed: %s", exc)
+        self._mark_disconnected()
+        return False
 
     # ------------------------------------------------------------------
     # Internal reconnect loop + keepalive
@@ -135,16 +139,21 @@ class TCPStreamer:
         )
         self._recv_thread.start()
 
-        # Send keepalive frames every second
+        # Send keepalive frames every second.  The lock is held across
+        # sendall() for the same reason as in send(): PING and state
+        # packets must never interleave on the wire.
         last_ping = time.monotonic()
         while self._running:
             try:
                 now = time.monotonic()
                 if now - last_ping >= 1.0:
-                    try:
-                        sock.sendall(_PING_PAYLOAD)
-                    except OSError:
-                        break
+                    with self._lock:
+                        if self._sock is not sock or not self._running:
+                            break
+                        try:
+                            sock.sendall(_PING_PAYLOAD)
+                        except OSError:
+                            break
                     last_ping = now
                 time.sleep(0.1)
             except Exception:

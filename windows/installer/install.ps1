@@ -23,6 +23,7 @@ $APP_NAME      = "Bluetooth Bridge"
 $INSTALL_DIR   = "$env:USERPROFILE\bluetooth_bridge"
 $VENV_DIR      = "$INSTALL_DIR\venv"
 $LISTEN_PORT   = 9999
+$WEBUI_PORT    = 0
 $REPO_BASE     = "https://raw.githubusercontent.com/xynnpg/bluetooth-bridge/main/windows"
 $REPO_ZIP_URL  = "https://github.com/xynnpg/bluetooth-bridge/archive/refs/heads/main.zip"
 
@@ -127,6 +128,7 @@ Write-Step "Configuring Windows Defender Firewall …"
 try {
     Remove-NetFirewallRule -DisplayName "Xbox Bluetooth Bridge" -ErrorAction SilentlyContinue
     Remove-NetFirewallRule -DisplayName "Xbox Bluetooth Bridge Discovery" -ErrorAction SilentlyContinue
+
 
     New-NetFirewallRule -DisplayName "Xbox Bluetooth Bridge" `
                         -Direction Inbound `
@@ -319,6 +321,8 @@ try {
         --collect-all vgamepad `
         --collect-all pystray `
         --collect-all PIL `
+        --collect-all flask `
+        --hidden-import waitress `
         "$INSTALL_DIR\src\main.py" 2>$null | Out-Null
     Write-Success "Built native GUI executable: $exePath"
 } catch {
@@ -332,11 +336,33 @@ Write-Step "Writing configuration …"
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText("$INSTALL_DIR\config.ini", @"
 [app]
-listen_port = $LISTEN_PORT
-auto_start  = true
+listen_port   = $LISTEN_PORT
+listen_host   = 0.0.0.0
+auto_discover = true
+auto_start    = true
+log_level     = INFO
+
+[webui]
+enabled         = true
+host            = 127.0.0.1
+port            = $WEBUI_PORT
+open_on_launch  = false
+auto_refresh_ms = 750
+
+[controller]
+rumble_enabled        = true
+low_battery_warn_pct  = 15
+deadzone_stick        = 15
+deadzone_trigger      = 1
+invert_left_y         = false
+invert_right_y        = false
+
+[tray]
+show_battery = true
 
 [network]
-discovery_port = 9876
+discovery_port       = 9876
+keepalive_timeout_s  = 6.0
 "@, $utf8NoBom)
 
 # Fallback VBS launcher if needed
@@ -428,9 +454,13 @@ Write-Info "Your Windows IP: $localIp"
 Write-Info "App location:    $INSTALL_DIR"
 Write-Info "Listen port:     $LISTEN_PORT"
 Write-Host ""
+Write-Host "  Dashboard (local web UI):  http://127.0.0.1:<random port>/  (see config.ini)" -ForegroundColor Green
+Write-Host "  Right-click the tray icon → 'Open Web UI' to launch it." -ForegroundColor Green
+Write-Host ""
 Write-Host "  On your Linux machine, run:" -ForegroundColor Yellow
 Write-Host "  curl -fsSL https://raw.githubusercontent.com/xynnpg/bluetooth-bridge/main/linux/install.sh | bash -s $localIp" -ForegroundColor Yellow
 Write-Host ""
 Write-Info "Logs:      $INSTALL_DIR\bluetooth-bridge.log"
+Write-Info "Config:    $INSTALL_DIR\config.ini"
 Write-Info "Uninstall: delete $INSTALL_DIR and the Start Menu shortcut"
 Write-Host ""

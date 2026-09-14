@@ -319,29 +319,21 @@ def _norm_trigger(val: int, abs_info) -> int:
 # ---------------------------------------------------------------------------
 
 def make_state(device: evdev.InputDevice, abs_info: dict) -> ControllerState:
-    """Create a ControllerState pre-seeded with the kernel's current axis values.
+    """Create a ControllerState with all axes at neutral defaults.
 
-    Sticks are seeded from the kernel-cached value (so a held stick doesn't
-    snap to centre on the first packet).  Triggers are always initialised to 0
-    because the kernel-cached value at BT connect time is unreliable and often
-    non-zero even when the physical trigger is fully released.
+    Sticks are intentionally NOT seeded from the kernel cache.  The Xbox
+    Bluetooth driver often caches a stale non-centre value (typically -32768,
+    i.e. hard-left / hard-up) for ABS_X and ABS_Y immediately after pairing,
+    before the controller has sent any real events.  If we seed from that
+    cached value the first packet shows the left stick pegged at -1.0 and the
+    user sees phantom drift until they physically touch the stick.
+
+    The same reasoning already applied to triggers ("don't trust the kernel
+    cache" — see make_state prior art for triggers).  We now apply it to
+    sticks too.  The first genuine evdev EV_ABS event will update the value
+    within milliseconds of the bridge starting.
     """
-    state = ControllerState()
-    caps = device.capabilities()
-    for code, infos in caps.get(evdev.ecodes.EV_ABS, []):
-        if code not in _ABS_AXES:
-            continue
-        if code not in _STICK_CODES:
-            # Triggers: always start at 0 — don't trust the kernel cache
-            continue
-        field_name = _ABS_AXES[code]
-        try:
-            val = device.absinfo(code).value
-        except Exception:
-            continue
-        ai = abs_info.get(code, infos)
-        setattr(state, field_name, _norm_stick(val, ai))
-    return state
+    return ControllerState()  # lthumb_x=32768, lthumb_y=32768, rthumb_x=32768, rthumb_y=32768
 
 
 # ---------------------------------------------------------------------------
@@ -371,25 +363,48 @@ def read_next_state(
         if not ready:
             continue  # 1s timeout — re-check _running / device state
 
-        event = device.read_one()
-        if event is None:
-            continue
+        # Drain the complete queue snapshot. Reading only one event per call
+        # can overrun evdev during a busy input burst and lose button releases.
+        while True:
+            event = device.read_one()
+            if event is None:
+                break
 
-        if event.type == evdev.ecodes.EV_SYN:
-            # Only deliver on SYN_REPORT (code 0), skip SYN_DROPPED etc.
-            if event.code == evdev.ecodes.SYN_REPORT:
-                return state
-            continue
+            if event.type == evdev.ecodes.EV_SYN:
+                if event.code == evdev.ecodes.SYN_DROPPED:
+                    _resync_keys(state, device)
+                elif event.code == evdev.ecodes.SYN_REPORT:
+                    return state
+                continue
 
-        if event.type == evdev.ecodes.EV_ABS:
-            _update_abs(state, event, abs_info)
-        elif event.type == evdev.ecodes.EV_KEY:
-            _update_key(state, event)
+            if event.type == evdev.ecodes.EV_ABS:
+                _update_abs(state, event, abs_info)
+            elif event.type == evdev.ecodes.EV_KEY:
+                _update_key(state, event)
 
 
 # ---------------------------------------------------------------------------
 # Internal update helpers
 # ---------------------------------------------------------------------------
+
+def _resync_keys(state: ControllerState, device: evdev.InputDevice) -> None:
+    """Rebuild digital state after evdev reports that events were dropped."""
+    state.buttons_low = 0
+    state.buttons_high = 0
+    state._hat_x = 0
+    state._hat_y = 0
+    state.lt = 0
+    state.rt = 0
+    try:
+        for code in device.active_keys():
+            class _KeyEvent:
+                type = evdev.ecodes.EV_KEY
+                value = 1
+
+            _KeyEvent.code = code
+            _update_key(state, _KeyEvent())
+    except (OSError, AttributeError) as exc:
+        logger.warning("Could not resync controller buttons after SYN_DROPPED: %s", exc)
 
 def _update_abs(state: ControllerState, event, abs_info: dict) -> None:
     code = event.code

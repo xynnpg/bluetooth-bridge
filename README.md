@@ -12,7 +12,7 @@ Stream your Bluetooth Xbox controller from a Linux server (or any Linux machine)
  Linux Server                           Windows PC
 ──────────────                          ───────────
 ┌──────────────────┐                   ┌──────────────────┐
-│  Docker          │  TCP 24-byte pkts │  Tray App        │
+│  Docker          │  TCP 54-byte pkts │  Tray + Web UI   │
 │  container       │ ─────────────────►│  Receives state  │
 │                  │   ~60 Hz          │        ↓         │
 │  evdev reads     │  127.0.0.1:9999   │  ViGEmBus        │
@@ -114,10 +114,19 @@ Once both sides are installed, just:
 
 ### Checking status
 
-**Windows:** Right-click the tray icon → *Open App* for the live dashboard
-(controller name, MAC, battery % with bar, current rumble motors, peer IP,
-uptime, packet count, and a scrolling list of recent events). The tray
-icon's hover tooltip also shows the current battery %.
+**Windows:** Right-click the tray icon → *Open Web UI* (or visit
+<http://127.0.0.1:<port>/> on the Windows PC, where *port* is shown by the
+tray's *Open Web UI* action or in `config.ini`). The local dashboard shows the
+connection state, controller name/MAC, battery % with bar, live rumble
+motors, peer IP, uptime, packet count, a live event feed, a filterable log
+viewer, and every setting. The tray tooltip also shows the battery %.
+
+The tray menu is deliberately minimal: **Open Web UI · Reset · Reconnect ·
+Open App Folder · Exit**.
+
+The dashboard binds to a random free localhost port on first start (persisted
+in `config.ini` as `[webui] port`; `0` means "pick one automatically"). The
+tray's *Open Web UI* item, and the **About** tab, show the real URL.
 
 **Linux:**
 ```bash
@@ -146,28 +155,57 @@ systemctl daemon-reload
 [app]
 listen_port   = 9999
 listen_host   = 0.0.0.0
-auto_start    = true
 auto_discover = true
+auto_start    = true
+log_level     = INFO
+
+[webui]
+enabled         = true
+host            = 127.0.0.1
+port            = 8080
+open_on_launch  = false
+auto_refresh_ms = 750
 
 [controller]
-rumble_enabled      = true
+rumble_enabled       = true
 low_battery_warn_pct = 15
+deadzone_stick       = 15
+deadzone_trigger     = 1
+invert_left_y        = false
+invert_right_y       = false
 
 [tray]
-show_battery         = true
-open_app_on_launch   = false
+show_battery = true
+
+[network]
+discovery_port      = 9876
+keepalive_timeout_s = 6.0
 ```
+
+Everything here can also be edited live in the web UI (*Settings* tab), which
+writes this file back and applies what it can without a restart.
 
 | Section | Key | Default | Description |
 |---------|-----|---------|-------------|
 | `app`        | `listen_port`   | `9999`    | TCP port Windows listens on |
 | `app`        | `listen_host`   | `0.0.0.0` | Bind address |
-| `app`        | `auto_start`    | `true`    | Start with Windows |
 | `app`        | `auto_discover` | `true`    | Broadcast IP for Linux auto-discovery (UDP 9876) |
+| `app`        | `auto_start`    | `true`    | Start with Windows |
+| `app`        | `log_level`     | `INFO`    | Log verbosity (applies immediately) |
+| `webui`      | `enabled`       | `true`    | Serve the local dashboard |
+| `webui`      | `host`          | `127.0.0.1` | Dashboard bind address (keep local-only) |
+| `webui`      | `port`          | `8080`    | Dashboard port |
+| `webui`      | `open_on_launch`| `false`   | Open the dashboard on start |
+| `webui`      | `auto_refresh_ms`| `750`    | Dashboard poll interval |
 | `controller` | `rumble_enabled`| `true`    | Forward game rumble back to the controller |
-| `controller` | `low_battery_warn_pct` | `15` | Low-battery threshold (for future use) |
+| `controller` | `low_battery_warn_pct` | `15` | Highlight battery at/below this % |
+| `controller` | `deadzone_stick`| `15`      | Thumbstick deadzone (%) |
+| `controller` | `deadzone_trigger`| `1`     | Trigger deadzone (%) |
+| `controller` | `invert_left_y` | `false`   | Invert left stick Y |
+| `controller` | `invert_right_y`| `false`   | Invert right stick Y |
 | `tray`       | `show_battery`  | `true`    | Show battery % in tray tooltip |
-| `tray`       | `open_app_on_launch` | `false` | Pop the dashboard when the app starts |
+| `network`    | `discovery_port`| `9876`    | UDP auto-discovery port |
+| `network`    | `keepalive_timeout_s` | `6.0` | Seconds of silence before "disconnected" |
 
 ### Linux config (`~/.bluetooth-bridge/.env`)
 
@@ -316,9 +354,10 @@ bluetooth-bridge/
         ├── main.py         # Entry point
         ├── receiver.py     # TCP server (v2 + v1 fallback)
         ├── emitter.py      # vgamepad → ViGEmBus (with rumble notifications)
-        ├── tray.py         # System tray
-        ├── ui.py           # Dashboard, Settings, Log Viewer (Tk)
-        ├── state.py        # Thread-safe live state shared by tray/UI
+        ├── config.py       # config.ini schema, load/save/validate
+        ├── webui.py        # Local Flask dashboard (random localhost port)
+        ├── tray.py         # Minimal system tray
+        ├── state.py        # Thread-safe live state shared by tray/web UI
         └── discovery.py    # UDP broadcaster
 ```
 

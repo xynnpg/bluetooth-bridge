@@ -47,9 +47,11 @@ def _get_local_ip() -> str:
 class DiscoveryBroadcaster:
     """Sends BRIDGE_HELLO UDP packets every 5 seconds while running."""
 
-    def __init__(self, listen_port: int = 9999, broadcast_interval: float = 5.0):
+    def __init__(self, listen_port: int = 9999, broadcast_interval: float = 5.0,
+                 discovery_port: int = DISCOVERY_PORT):
         self.listen_port = listen_port
         self.interval = broadcast_interval
+        self.discovery_port = discovery_port
         self._running = False
         self._thread: threading.Thread | None = None
         self._local_ip: str | None = None
@@ -61,7 +63,7 @@ class DiscoveryBroadcaster:
         self._running = True
         self._local_ip = _get_local_ip()
         logger.info("Discovery broadcaster starting — will announce %s on UDP %d",
-                    self._local_ip, DISCOVERY_PORT)
+                    self._local_ip, self.discovery_port)
         self._thread = threading.Thread(target=self._run, name="DiscoveryBroadcast", daemon=True)
         self._thread.start()
 
@@ -84,7 +86,7 @@ class DiscoveryBroadcaster:
         payload = f"BRIDGE_HELLO:{self._local_ip}:{self.listen_port}".encode()
 
         try:
-            sock.sendto(payload, ("<broadcast>", DISCOVERY_PORT))
+            sock.sendto(payload, ("<broadcast>", self.discovery_port))
             logger.info("Discovery broadcast sent: %s:%d", self._local_ip, self.listen_port)
         except OSError as exc:
             logger.warning("Initial discovery broadcast failed: %s", exc)
@@ -94,7 +96,7 @@ class DiscoveryBroadcaster:
             if not self._running:
                 break
             try:
-                sock.sendto(payload, ("<broadcast>", DISCOVERY_PORT))
+                sock.sendto(payload, ("<broadcast>", self.discovery_port))
             except OSError as exc:
                 logger.debug("Discovery broadcast error: %s", exc)
                 break

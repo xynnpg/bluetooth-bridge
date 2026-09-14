@@ -239,8 +239,14 @@ class TCPReceiver:
                     break
                 buf += chunk
 
-                # Process v2 packets (54 B) first, then v1 (24 B)
-                # v2 packets start with proto byte at offset 13 == 0x02
+                # Process complete v2 packets (54 B).
+                # v2 packets are identified by proto byte at offset 13 == 0x02.
+                # We intentionally do NOT fall back to v1 (24-byte) parsing here:
+                # any sub-54-byte tail left in the buffer is either a partial v2
+                # packet still in-flight (kept for the next recv() call) or
+                # genuine garbage — neither should be parsed as a v1 frame,
+                # because doing so causes ghost button presses and extreme stick
+                # values when v2 packet tails are mis-interpreted as v1 headers.
                 processed = 0
                 while len(buf) >= _PAYLOAD_SIZE and processed < 16:
                     packet = buf[:_PAYLOAD_SIZE]
@@ -252,13 +258,14 @@ class TCPReceiver:
                         processed += 1
                         continue
                     if packet[13] != _PROTO_V2:
-                        # Probably a v1 packet from a legacy sender — try parsing
-                        v1 = StateParser.parse(packet[:_PAYLOAD_V1_SIZE])
-                        if v1 is not None:
-                            try: self.on_state(v1)
-                            except Exception as exc:
-                                logger.error("on_state callback error: %s", exc)
-                        buf = buf[_PAYLOAD_V1_SIZE:]
+                        # Unexpected proto byte — the stream is misaligned.
+                        # Discard one byte and re-sync rather than parsing garbage.
+                        logger.warning(
+                            "Unexpected proto byte 0x%02x at offset 13 — "
+                            "stream misaligned, discarding 1 byte to re-sync",
+                            packet[13],
+                        )
+                        buf = buf[1:]
                         processed += 1
                         continue
                     state = StateParser.parse(packet)
@@ -268,21 +275,8 @@ class TCPReceiver:
                         except Exception as exc:
                             logger.error("on_state callback error: %s", exc)
                     processed += 1
-                # Fallback: legacy v1 sender (only 24-byte frames)
-                while len(buf) >= _PAYLOAD_V1_SIZE:
-                    packet = buf[:_PAYLOAD_V1_SIZE]
-                    if packet == b"\xff" * _PAYLOAD_V1_SIZE:
-                        if self.on_ping:
-                            try: self.on_ping()
-                            except Exception: pass
-                        buf = buf[_PAYLOAD_V1_SIZE:]
-                        continue
-                    state = StateParser.parse(packet)
-                    buf = buf[_PAYLOAD_V1_SIZE:]
-                    if state is not None:
-                        try: self.on_state(state)
-                        except Exception as exc:
-                            logger.error("on_state callback error: %s", exc)
+                # Any remaining bytes are a partial v2 packet — leave them in
+                # buf so the next recv() call can complete the frame.
         except OSError as exc:
             logger.info("Connection error from %s: %s", addr[0], exc)
         finally:
