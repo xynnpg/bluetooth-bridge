@@ -62,7 +62,7 @@ SPEC: tuple[Field, ...] = (
           "Announce this PC over UDP so Linux finds it automatically."),
     Field("app", "auto_start", "Start with Windows", "bool", True,
           "Keep a shortcut in the Start Menu Startup folder."),
-    Field("app", "log_level", "Log Level", "choice", "INFO",
+    Field("app", "log_level", "Log Level", "choice", "DEBUG",
           "Verbosity of the log file and event feed.",
           choices=("DEBUG", "INFO", "WARNING", "ERROR")),
 
@@ -109,6 +109,12 @@ SPEC: tuple[Field, ...] = (
     Field("network", "keepalive_timeout_s", "Connection timeout (s)", "float", 6.0,
           "Treat the Linux side as gone after this many silent seconds.",
           1.0, 60.0, step=0.5),
+
+        Field("linux", "management_port", "Linux management port", "int", 9988,
+            "HTTP port exposed by the Linux container for diagnostics and restart.",
+            1024, 65535),
+        Field("linux", "management_token", "Linux management token", "str", "",
+            "Optional shared token for the Linux management API."),
 )
 
 _BY_NAME: dict[str, Field] = {f.name: f for f in SPEC}

@@ -24,6 +24,8 @@ import sys
 import threading
 import time
 import webbrowser
+import urllib.error
+import urllib.request
 
 logger = logging.getLogger("webui")
 
@@ -255,7 +257,12 @@ class WebUI:
             level  = (request.args.get("level") or "ALL").upper()
             module = (request.args.get("module") or "ALL")
             search = (request.args.get("search") or "").lower()
-            limit  = min(int(request.args.get("limit", 1500)), 8000)
+            raw_limit = request.args.get("limit", "1500")
+            try:
+                limit = min(max(int(raw_limit), 1), 8000)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False,
+                                "error": "limit must be an integer between 1 and 8000."}), 400
 
             out: list[dict] = []
             for line in _read_tail(self._log_path):
@@ -286,6 +293,22 @@ class WebUI:
         def get_config():
             return jsonify({"values": self._config.as_dict(),
                             "schema": self._config.schema()})
+
+        @app.get("/api/linux/status")
+        def linux_status():
+            return jsonify(self._linux_request("/api/status"))
+
+        @app.get("/api/linux/logs")
+        def linux_logs():
+            return jsonify(self._linux_request("/api/logs"))
+
+        @app.post("/api/linux/config")
+        def linux_config():
+            return jsonify(self._linux_request("/api/config", request.get_json(silent=True) or {}, "POST"))
+
+        @app.post("/api/linux/restart")
+        def linux_restart():
+            return jsonify(self._linux_request("/api/restart", {}, "POST"))
 
         @app.post("/api/config")
         def set_config():
@@ -364,6 +387,27 @@ class WebUI:
             return jsonify({"ok": True})
 
         return app
+
+    def _linux_request(self, path: str, payload: dict | None = None,
+                       method: str = "GET") -> dict:
+        """Proxy a management request to the Linux peer shown by the bridge."""
+        peer = self._state.snapshot().get("peer_ip", "")
+        port = self._config.get_int("linux.management_port")
+        if not peer:
+            return {"ok": False, "error": "Linux peer is not connected."}
+        url = f"http://{peer}:{port}{path}"
+        data = json.dumps(payload).encode() if method == "POST" else None
+        req = urllib.request.Request(url, data=data, method=method,
+                   headers={"Content-Type": "application/json"})
+        token = self._config.get_str("linux.management_token")
+        if token:
+            req.add_header("X-Bridge-Token", token)
+        try:
+            with urllib.request.urlopen(req, timeout=3) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (OSError, urllib.error.URLError, ValueError) as exc:
+            logger.warning("Linux management request %s failed: %s", path, exc)
+            return {"ok": False, "error": str(exc)}
 
 
 _ACTION_MESSAGES = {
@@ -484,6 +528,7 @@ _PAGE = r"""<!doctype html>
   <button data-tab="dash" class="active">Dashboard</button>
   <button data-tab="events">Events</button>
   <button data-tab="logs">Logs</button>
+  <button data-tab="linux">Linux container</button>
   <button data-tab="settings">Settings</button>
   <button data-tab="about">About</button>
 </nav>
@@ -526,6 +571,16 @@ _PAGE = r"""<!doctype html>
         <div class="bar sm"><i id="d-rlbar" style="background:var(--blue)"></i></div>
         <div class="kv" style="margin-top:10px"><span class="k">Right</span><span class="v" id="d-rr">0</span></div>
         <div class="bar sm"><i id="d-rrbar" style="background:var(--purple)"></i></div>
+      </div>
+      <div class="card">
+        <h3 class="b">Live input</h3>
+        <div class="kv"><span class="k">Brake (LT)</span><span class="v" id="d-lt">0</span></div>
+        <div class="bar sm"><i id="d-ltbar" style="background:var(--blue)"></i></div>
+        <div class="kv" style="margin-top:10px"><span class="k">Throttle (RT)</span><span class="v" id="d-rt">0</span></div>
+        <div class="bar sm"><i id="d-rtbar" style="background:var(--purple)"></i></div>
+        <div class="kv" style="margin-top:10px"><span class="k">Left stick</span><span class="v"><span id="d-lx">32768</span>, <span id="d-ly">32768</span></span></div>
+        <div class="kv"><span class="k">Right stick</span><span class="v"><span id="d-rx">32768</span>, <span id="d-ry">32768</span></span></div>
+        <div class="kv" style="margin-top:6px"><span class="k">Buttons</span><span class="v" id="d-buttons">0x00 / 0x00</span></div>
       </div>
     </div>
 
@@ -587,6 +642,30 @@ _PAGE = r"""<!doctype html>
     </div>
   </section>
 
+  <!-- LINUX CONTAINER -->
+  <section class="tab" id="tab-linux">
+    <div class="dash-intro">
+      <div><div class="eyebrow">Remote Linux control</div><h1>Linux container</h1>
+      <p>Inspect the Linux bridge, read its logs, change connection settings, or restart it.</p></div>
+      <span class="tag" id="linux-status">OFFLINE</span>
+    </div>
+    <div class="grid">
+      <div class="card"><h3>Container status</h3>
+        <div class="kv"><span class="k">API</span><span class="v" id="linux-api">—</span></div>
+        <div class="kv"><span class="k">PID</span><span class="v" id="linux-pid">—</span></div>
+        <div class="kv"><span class="k">Uptime</span><span class="v" id="linux-uptime">—</span></div>
+        <div class="kv"><span class="k">Controller device</span><span class="v" id="linux-device">—</span></div>
+        <div class="row" style="margin-top:14px"><button class="btn" onclick="loadLinux()">Refresh</button>
+          <button class="btn accent" onclick="restartLinux()">Restart container</button></div>
+      </div>
+      <div class="card"><h3>Linux settings</h3><div id="linux-form"></div>
+        <div class="row" style="margin-top:14px"><button class="btn accent" onclick="saveLinux()">Save settings</button></div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:14px"><div class="row" style="margin-bottom:12px"><h3 style="margin:0">Linux logs</h3><span class="spacer"></span><button class="btn" onclick="loadLinuxLogs()">Refresh</button></div>
+      <pre class="log" id="linux-log" style="height:440px"></pre></div>
+  </section>
+
   <!-- SETTINGS -->
   <section class="tab" id="tab-settings">
     <div class="card">
@@ -643,6 +722,7 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   b.classList.add("active");
   $("#tab-" + b.dataset.tab).classList.add("active");
   if (b.dataset.tab === "logs") loadLogs();
+  if (b.dataset.tab === "linux") { loadLinux(); loadLinuxLogs(); }
 });
 
 function fmtUptime(s){
@@ -745,6 +825,21 @@ async function pollState(){
     $("#d-rlbar").style.width = (rl/255*100) + "%";
     $("#d-rrbar").style.width = (rr/255*100) + "%";
 
+    // Live input — shows exactly what the virtual XInput device is
+    // receiving.  Use this to verify that physical-controller presses
+    // are reaching the game when a title misbehaves.
+    const lt = snap.lt|0, rt = snap.rt|0;
+    $("#d-lt").textContent = lt; $("#d-rt").textContent = rt;
+    $("#d-ltbar").style.width = (lt/255*100) + "%";
+    $("#d-rtbar").style.width = (rt/255*100) + "%";
+    $("#d-lx").textContent = snap.lthumb_x|0;
+    $("#d-ly").textContent = snap.lthumb_y|0;
+    $("#d-rx").textContent = snap.rthumb_x|0;
+    $("#d-ry").textContent = snap.rthumb_y|0;
+    $("#d-buttons").textContent =
+      "0x" + (snap.buttons_low|0).toString(16).padStart(2, "0") +
+      " / 0x" + (snap.buttons_high|0).toString(16).padStart(2, "0");
+
     const threshold = (snap.config && snap.config.performance_warning_ms) || 180;
     const lagging = lastRequestMs >= threshold || (snap.last_packet_ms >= threshold);
     $("#perf-warning").classList.toggle("show",
@@ -799,6 +894,39 @@ async function copyLogs(){
 async function clearLogs(){
   if(!confirm("Delete the log file contents?")) return;
   try{ await api("/api/logs/clear", {method:"POST"}); loadLogs(); toast("Log cleared."); }
+  catch(e){ toast(e.message, true); }
+}
+
+function linuxFields(config){
+  const names = ["PC_HOST", "PC_PORT", "CONTROLLER_MAC", "LOG_LEVEL", "MANAGEMENT_TOKEN"];
+  const labels = {PC_HOST:"Windows host", PC_PORT:"Windows port", CONTROLLER_MAC:"Controller MAC", LOG_LEVEL:"Log level", MANAGEMENT_TOKEN:"Management token"};
+  return names.map(name => `<div class="field"><div class="meta"><div class="lbl">${labels[name]}</div></div><div class="ctl"><input type="text" data-linux="${name}" value="${escapeHtml(config?.[name] || "")}"></div></div>`).join("");
+}
+async function loadLinux(){
+  try{
+    const data = await api("/api/linux/status");
+    if (!data.ok) throw new Error(data.error || "Linux API unavailable");
+    $("#linux-status").textContent = "ONLINE";
+    $("#linux-api").textContent = (data.config?.MANAGEMENT_PORT || "9988");
+    $("#linux-pid").textContent = data.pid;
+    $("#linux-uptime").textContent = fmtUptime(data.uptime_s);
+    $("#linux-device").textContent = data.controller_path || (data.controller ? "connected" : "not found");
+    $("#linux-form").innerHTML = linuxFields(data.config);
+  }catch(e){ $("#linux-status").textContent = "OFFLINE"; $("#linux-api").textContent = e.message; }
+}
+async function loadLinuxLogs(){
+  try{ const data = await api("/api/linux/logs"); $("#linux-log").textContent = (data.lines || []).join("\n") || "No Linux logs available."; }
+  catch(e){ $("#linux-log").textContent = "Linux logs unavailable: " + e.message; }
+}
+async function saveLinux(){
+  const values = {}; document.querySelectorAll("[data-linux]").forEach(el => values[el.dataset.linux] = el.value);
+  try{ const data = await api("/api/linux/config", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({values})});
+    if (!data.ok) throw new Error(data.error || "Save failed"); toast("Linux settings saved. Restart to apply.");
+  }catch(e){ toast(e.message, true); }
+}
+async function restartLinux(){
+  if(!confirm("Restart the Linux bridge container? Input will pause briefly.")) return;
+  try{ const data = await api("/api/linux/restart", {method:"POST"}); if (!data.ok) throw new Error(data.error || "Restart failed"); toast("Linux restart requested."); }
   catch(e){ toast(e.message, true); }
 }
 

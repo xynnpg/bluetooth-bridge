@@ -47,6 +47,15 @@ class BridgeState:
         self.buttons_low     = 0
         self.buttons_high    = 0
         self.dpad            = 0
+        # Triggers and stick axes — exposed via snapshot() so the web UI
+        # can display them and we can verify the bridge is forwarding
+        # input correctly when a game (e.g. ETS2) misbehaves.
+        self.lt              = 0    # 0-255
+        self.rt              = 0    # 0-255
+        self.lthumb_x        = 32768
+        self.lthumb_y        = 32768
+        self.rthumb_x        = 32768
+        self.rthumb_y        = 32768
         self.last_event_ts   = ""
         self.recent_events: collections.deque = collections.deque(maxlen=_RECENT_EVENTS_MAX)
         self.button_events: collections.deque = collections.deque(maxlen=_BUTTON_EVENTS_MAX)
@@ -80,6 +89,14 @@ class BridgeState:
             self.buttons_low = int(state.get("buttons_low", 0))
             self.buttons_high = int(state.get("buttons_high", 0))
             self.dpad = int(state.get("dpad", 0))
+            # Triggers and sticks — used by the web UI's "Live input" panel
+            # and by anyone debugging a game that mis-reads the controller.
+            self.lt       = int(state.get("lt", self.lt))       & 0xFF
+            self.rt       = int(state.get("rt", self.rt))       & 0xFF
+            self.lthumb_x = int(state.get("lthumb_x", self.lthumb_x)) & 0xFFFF
+            self.lthumb_y = int(state.get("lthumb_y", self.lthumb_y)) & 0xFFFF
+            self.rthumb_x = int(state.get("rthumb_x", self.rthumb_x)) & 0xFFFF
+            self.rthumb_y = int(state.get("rthumb_y", self.rthumb_y)) & 0xFFFF
             self._record_button_changes(old_low, self.buttons_low, old_high,
                                         self.buttons_high, old_dpad, self.dpad)
 
@@ -156,6 +173,12 @@ class BridgeState:
                 "buttons_low":      self.buttons_low,
                 "buttons_high":     self.buttons_high,
                 "dpad":             self.dpad,
+                "lt":               self.lt,
+                "rt":               self.rt,
+                "lthumb_x":         self.lthumb_x,
+                "lthumb_y":         self.lthumb_y,
+                "rthumb_x":         self.rthumb_x,
+                "rthumb_y":         self.rthumb_y,
                 "button_events":    list(self.button_events),
                 "uptime_s":         int(time.monotonic() - self._start_time),
                 "last_event_ts":    self.last_event_ts,

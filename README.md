@@ -133,6 +133,13 @@ tray's *Open Web UI* item, and the **About** tab, show the real URL.
 docker logs -f xbox-bridge
 ```
 
+The Windows dashboard's **Linux container** tab uses port `9988` to show the
+Linux process status and logs, update the Linux `.env`, and request a
+container restart. Set `MANAGEMENT_TOKEN` to the same value in the Linux
+`.env` and Windows Settings if the management port is reachable beyond your
+trusted LAN. The Linux log file is stored at
+`~/.bluetooth-bridge/xbox-bridge.log` by the installer.
+
 ### Uninstalling
 
 **Windows:** Start Menu → *Bluetooth Bridge* → *Uninstall*
@@ -162,7 +169,7 @@ log_level     = INFO
 [webui]
 enabled         = true
 host            = 127.0.0.1
-port            = 8080
+port            = 8764
 open_on_launch  = false
 auto_refresh_ms = 750
 
@@ -194,7 +201,7 @@ writes this file back and applies what it can without a restart.
 | `app`        | `log_level`     | `INFO`    | Log verbosity (applies immediately) |
 | `webui`      | `enabled`       | `true`    | Serve the local dashboard |
 | `webui`      | `host`          | `127.0.0.1` | Dashboard bind address (keep local-only) |
-| `webui`      | `port`          | `8080`    | Dashboard port |
+| `webui`      | `port`          | `8764`    | Dashboard port |
 | `webui`      | `open_on_launch`| `false`   | Open the dashboard on start |
 | `webui`      | `auto_refresh_ms`| `750`    | Dashboard poll interval |
 | `controller` | `rumble_enabled`| `true`    | Forward game rumble back to the controller |
@@ -233,9 +240,14 @@ PC_HOST=192.168.1.101
 
 ## Network Packets
 
-Fixed 54-byte v2 binary frames at ~60 Hz — no JSON overhead. The connection is
+Fixed 54-byte v2 binary frames — no JSON overhead. The connection is
 full-duplex: state flows Linux → Windows, while game rumble flows
 Windows → Linux (same socket, same packet format).
+
+A frame is sent for every controller event and, while the controller is
+idle, a heartbeat frame is sent every 50 ms. Every frame is a **complete,
+authoritative snapshot** of the controller, so a frame that is lost in
+transit is corrected by the next one instead of latching a button forever.
 
 | Offset | Size | Field | Range / Notes |
 |--------|------|-------|---------------|
@@ -250,14 +262,58 @@ Windows → Linux (same socket, same packet format).
 | 12    | 1 | `dpad` | UP=1 RIGHT=2 DOWN=4 LEFT=8 (independent bits) |
 | 13    | 1 | `proto` | `0x02` for v2. Receiver uses this to pick the parser. |
 | 14    | 1 | `battery` | 0–100, `0xFF` = unknown |
-| 15    | 1 | `flags` | bit0 = charging, bit1 = battery-valid |
+| 15    | 1 | `flags` | bit0 = charging, bit1 = battery-valid, bit2 = "the sender streams idle heartbeats", bit3 = "byte 52 holds a valid checksum" |
 | 16    | 1 | `rumble_left`  | 0–255 (large motor) |
 | 17    | 1 | `rumble_right` | 0–255 (small motor) |
 | 18–23 | 6 | `mac` | 6 raw bytes, e.g. `AA BB CC DD EE FF` (zeros if unknown) |
 | 24–39 | 16 | `name` | ASCII, NUL-padded, truncated to 16 chars |
-| 40–53 | 14 | `padding` | zeros |
+| 40–51 | 12 | `reserved` | zeros |
+| 52    | 1 | `checksum` | `sum(bytes 0..51) & 0xFF` (announced by flag bit 3) |
+| 53    | 1 | `reserved` | zeros |
 
 Ping frame (54 × `\xff`) sent every second as a keepalive.
+
+### Why the frames are validated
+
+The wire format is a sequence of fixed-size frames, so a frame that is cut
+short on the wire would shift every frame behind it — and a shifted window
+can look exactly like a real frame. The receiver therefore validates the
+proto byte, the D-pad mask, the battery range, the flag bits, the reserved
+bytes and the checksum before it hands anything to the virtual pad.
+
+The checksum is announced with **flag bit 3**, not by its value, so a frame
+whose checksum happens to be `0` is protected as well.
+
+How the receiver reacts to a broken stream depends on the peer:
+
+* **A peer that announces checksums** is verified on every frame, so the
+  receiver can hunt for the next frame boundary byte by byte — a shifted
+  window can never pass the validation. If the stream stays broken, or the
+  peer stops announcing the checksum, the connection is dropped and the
+  Linux side reconnects with a fresh, aligned stream.
+* **A legacy peer** (an older Linux side, no flag bit 3) has no such
+  protection: nothing tells a shifted window from a real frame. For those
+  the connection is dropped on a misalignment instead of re-syncing.
+
+Either way the game never sees a press that nobody made.
+
+### Why the "idle heartbeat" flag matters
+
+Flag bit 2 tells the PC that this sender keeps streaming the current state
+even when the controller does nothing. Only such a peer is watched with the
+input watchdog on the PC side — with an older Linux side (which only
+reports when the controller is used) a button that is held for a long time
+must not be released by the PC while it is still being held.
+
+### Why buttons are released explicitly
+
+The Windows side does not rely on "reset the pad and press what is held"
+to release a button: it keeps track of the buttons it reported and issues
+an explicit `release_button()` for every button that was let go of. If the
+frame carrying a release is lost, the next frame still says "not pressed"
+and the button is released then. In addition the pad releases everything
+when the input stream goes quiet (a watchdog on the *state* frames — the
+keepalive pings do not keep a dead input pipeline alive).
 
 ### Backward compatibility
 
@@ -323,6 +379,128 @@ sudo hciconfig  # show adapters
 
 - Move the Linux server closer to the controller
 - Some USB Bluetooth adapters have limited range — a dedicated BT 5.0 adapter helps
+
+### A button stays held after I let go of it
+
+The bridge releases a button as soon as the frame that says "not pressed"
+arrives, and it re-sends the full controller state every 50 ms, so a lost
+frame heals itself. If a button is *still* held:
+
+1. Open the **Live input** panel on the dashboard — it shows the button
+   bits the Windows side currently receives.
+2. Compare it with the Linux log (`docker logs -f xbox-bridge`): the lines
+   `input: … bl=0x… bh=0x…` show what the Linux side believes is pressed.
+   - The **Linux** log still shows the button pressed → the release event
+     never arrived from the controller. The bridge re-reads the button
+     state from the kernel when the kernel reports dropped events
+     (`SYN_DROPPED`); a Bluetooth adapter with a busy/dropping link is the
+     usual cause.
+   - The **Linux** log shows it released but the **Windows** side does not
+     → the frames are not arriving. The Windows log then contains
+     `Invalid frame … stream misaligned` or `No controller state for … s`;
+     both mean the connection had to be re-established.
+3. The Windows watchdog releases every button when no state frame arrives
+   for `network.keepalive_timeout_s` seconds, so a dead input pipeline can
+   no longer keep a button latched in the game.
+
+### The game crashes when I play
+
+- Check the Windows log for `Invalid frame … stream misaligned`: the
+  receiver refuses to decode a shifted frame, so a corrupted stream can no
+  longer turn into phantom button presses.
+- Check for `Send timed out … dropping the connection` in the Linux log:
+  the link stalled mid-frame, the connection was dropped on purpose and
+  the frames start again on a fresh, aligned stream.
+
+---
+
+## Diagnostics
+
+Both sides keep an **input trace**: a separate log with millisecond
+precision that follows every button from the physical controller to the
+virtual gamepad. It is the log to look at when a button gets stuck.
+
+| Side | File |
+|------|------|
+| Linux | `~/.bluetooth-bridge/input-trace.log` (written by the container) |
+| Windows | `%LOCALAPPDATA%\bluetooth_bridge\input-trace.log` |
+
+```
+21:14:23.481 LINUX  BTN A        press          <- the controller reports it
+21:14:23.482 LINUX  TX buttons=01/00 dpad=0 lt=0 rt=0
+21:14:23.512 WIN    RX buttons=01/00 dpad=0 lt=0 rt=0
+21:14:23.513 WIN    PAD A        press          <- the game sees it
+21:14:27.902 LINUX  BTN A        release        <- the release is reported …
+21:14:27.918 WIN    PAD A        release        <- … and reaches the game
+```
+
+Every line is `H:M:S.mmm SOURCE message`, so the two files can simply be
+merged and sorted by time.
+
+### Collect and merge
+
+On the Windows PC (it pulls the Linux trace through the management API
+and merges both files):
+
+```powershell
+python tools\collect_input_trace.py --linux 192.168.0.10
+```
+
+On the Linux host:
+
+```bash
+python3 tools/collect_input_trace.py
+```
+
+The script writes `input-trace-<date>.txt` and reports the interesting
+part:
+
+```
+!! suspicious events:
+   21:14:23.513  WIN    A was pressed and never released — this button is still held
+   21:14:27.902  LINUX  the release of A never reached the Windows side — the button stays held in the game
+```
+
+That tells you where the problem is:
+
+| What the trace shows | Where the problem is |
+|----------------------|----------------------|
+| No `BTN … release` on the **Linux** side | The controller/driver never reported the release (Bluetooth link, evdev) |
+| `BTN … release` on Linux but no `PAD … release` on Windows | The release was lost on the way (network) |
+| `PAD … release` on Windows but the button is still held in the game | The virtual pad did not let go (ViGEmBus) |
+
+The regular logs (`docker logs -f xbox-bridge` and
+`%LOCALAPPDATA%\bluetooth_bridge\bluetooth-bridge.log`) use the same
+`H:M:S` timestamps and contain the rest (connections, resyncs,
+watchdogs).
+
+---
+
+## Development
+
+### Tests
+
+The regression suite covers the whole chain — evdev → packet → TCP →
+receiver → virtual pad — with in-process fakes for `evdev` and `vgamepad`
+(neither can be installed on a test machine: one needs a real input
+device, the other a real ViGEmBus driver).
+
+```bash
+uv venv .venv --python python3.14      # or: python3 -m venv .venv
+uv pip install --python .venv/bin/python pytest
+.venv/bin/python -m pytest tests/ -q
+```
+
+The suite is the executable specification of the input pipeline:
+
+| File | What it guards |
+|------|----------------|
+| `tests/test_linux_input_pipeline.py` | evdev → state → packet (press/release, D-pad, triggers, `SYN_DROPPED` resync) |
+| `tests/test_linux_transport.py` | frame atomicity on the wire, reconnect, idle heartbeat |
+| `tests/test_windows_receiver.py` | frame validation, keepalive, corrupted stream |
+| `tests/test_windows_emitter.py` | explicit press/release, input watchdog |
+| `tests/test_end_to_end.py` | the full chain, including dropped frames and a corrupted stream |
+| `tests/test_emitter_stuck_buttons.py` | the original "button stays held" regression |
 
 ---
 

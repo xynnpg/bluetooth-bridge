@@ -8,6 +8,7 @@ services:
     network_mode: host
     privileged: true
     volumes:
+      - .:/config:rw
       - /var/run/dbus:/var/run/dbus:ro
       - /run/dbus:/run/dbus:ro
       - /dev/input:/dev/input:ro
@@ -17,3 +18,7 @@ services:
       - PC_PORT=${PC_PORT:-9999}
       - CONTROLLER_MAC=${CONTROLLER_MAC}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_FILE=${LOG_FILE:-/config/xbox-bridge.log}
+      - MANAGEMENT_PORT=${MANAGEMENT_PORT:-9988}
+      - MANAGEMENT_CONFIG_DIR=/config
+      - MANAGEMENT_TOKEN=${MANAGEMENT_TOKEN:-}

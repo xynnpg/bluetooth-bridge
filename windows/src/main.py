@@ -31,6 +31,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+from . import trace
 from .receiver     import TCPReceiver
 from .emitter      import XInputEmitter
 from .tray         import TrayManager
@@ -84,6 +85,12 @@ def _configure_logging(state: BridgeState, level_name: str) -> None:
         root.addHandler(ch)
 
     eb_fmt = logging.Formatter("%(message)s")
+    # The input trace: a separate, millisecond-precise log of the whole
+    # input path (see the "Diagnostics" section of the README).
+    trace_path = trace.setup()
+    if trace_path:
+        root.info("Input trace log: %s", trace_path)
+
     eb = _EventLogHandler(state, level=logging.INFO)
     eb.setFormatter(eb_fmt)
     root.addHandler(eb)
@@ -131,6 +138,13 @@ class BridgeApp:
         self._pc_reachable  = False
         self._peer_ip       = ""
         self._last_recv     = time.monotonic()
+        # Timestamp of the last *state* frame.  The keepalive PINGs are
+        # tracked separately: a peer that only sends PINGs is alive but its
+        # input pipeline is dead, and the pad must not keep the buttons it
+        # received before.
+        self._last_state_at = time.monotonic()
+        # The rumble that was last sent to the controller.
+        self._last_rumble = (0, 0)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -234,6 +248,7 @@ class BridgeApp:
 
     def _on_disconnect(self, peer_ip: str) -> None:
         logger.info("Linux bridge disconnected from %s", peer_ip)
+        trace.event("DISCONNECT from %s", peer_ip)
         self._pc_reachable = False
         self._emitter.clear()
         self._state.on_disconnect()
@@ -249,6 +264,7 @@ class BridgeApp:
 
         self._controller_ok = True
         self._last_recv     = time.monotonic()
+        self._last_state_at = self._last_recv
         self._state.on_state(state)
 
         try:
@@ -262,9 +278,23 @@ class BridgeApp:
             return
         if not self._pc_reachable:
             return
+        self._last_rumble = (left, right)
         pkt = _build_rumble_packet(left, right)
         if not self._receiver.send_state(pkt):
             logger.debug("Rumble packet dropped (no active connection)")
+
+    def _resend_rumble(self) -> None:
+        """Send the current rumble state again.
+
+        The rumble is only sent when the game changes it, so a lost packet
+        would leave the motor running until the next change.  Unlike the
+        buttons — where every frame is a complete snapshot — the rumble
+        needs to be repeated to be self-healing.
+        """
+        if self._receiver is None or not self._pc_reachable:
+            return
+        left, right = self._last_rumble
+        self._receiver.send_state(_build_rumble_packet(left, right))
 
     def _on_settings_applied(self, changed: dict) -> None:
         """React to a save from the web dashboard without a restart."""
@@ -291,9 +321,25 @@ class BridgeApp:
     # Internal
     # ------------------------------------------------------------------
 
+    def _peer_streams_heartbeats(self) -> bool:
+        """True when the peer is known to keep streaming the state.
+
+        A peer that only reports when the controller is used (an older
+        version of the Linux side) must not be watched with the state
+        watchdog: a button that is held for a long time would be released
+        while it is still being held.  Newer peers announce that they
+        stream the state continuously (flag bit 2 of every frame).
+        """
+        receiver = self._receiver
+        if receiver is None:
+            return True      # no receiver yet — nothing better to go on
+        return bool(getattr(receiver, "_peer_streams", False))
+
     def _monitor_loop(self) -> None:
         while self._running:
             time.sleep(0.5)
+            if not self._running:
+                break
 
             if self._pc_reachable:
                 timeout = self._config.get_float("network.keepalive_timeout_s")
@@ -303,6 +349,24 @@ class BridgeApp:
                     self._emitter.clear()
                     self._state.on_disconnect()
                     logger.warning("Linux bridge gone (%.1f s silence)", elapsed)
+                    trace.event("TIMEOUT Linux bridge gone (%.1f s silence) — "
+                                "released all buttons", elapsed)
+                else:
+                    # The connection is alive but the *input* stopped: the
+                    # peer only sends keepalives.  Let go of every button
+                    # so a dead input pipeline cannot leave a button
+                    # latched in the game.
+                    stale = time.monotonic() - self._last_state_at
+                    if stale > timeout and self._peer_streams_heartbeats():
+                        self._emitter.clear()
+                        logger.warning("No controller state for %.1f s — "
+                                       "released all buttons", stale)
+                        trace.event("WATCHDOG no controller state for %.1f s — "
+                                    "released all buttons", stale)
+
+            # Repeat the rumble so a lost packet cannot leave the motor
+            # running forever.
+            self._resend_rumble()
 
             snap = self._state.snapshot()
             self._tray.update(

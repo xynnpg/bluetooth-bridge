@@ -175,6 +175,7 @@ services:
     # always present, even before the device shows up). Rumble will
     # silently no-op if no node exists for the controller.
     volumes:
+      - .:/config:rw
       - /var/run/dbus:/var/run/dbus:ro
       - /run/dbus:/run/dbus:ro
       - /dev/input:/dev/input:ro
@@ -190,6 +191,11 @@ services:
       - /dev/hidraw7:/dev/hidraw7:rwm
     env_file:
       - .env
+    environment:
+      - LOG_FILE=/config/xbox-bridge.log
+      - MANAGEMENT_PORT=${MANAGEMENT_PORT:-9988}
+      - MANAGEMENT_CONFIG_DIR=/config
+      - MANAGEMENT_TOKEN=${MANAGEMENT_TOKEN:-}
 YML
 
 # .env
@@ -200,9 +206,13 @@ PC_HOST=$PC_HOST
 PC_PORT=$EXTERNAL_PORT
 
 # Leave blank to auto-discover controller, or set MAC (AA:BB:CC:DD:EE:FF)
-CONTROLLER_MAC=
+CONTROLLER_MAC=$CONTROLLER_MAC
 
 LOG_LEVEL=INFO
+LOG_FILE=/config/xbox-bridge.log
+MANAGEMENT_PORT=9988
+# Optional token used by the Windows dashboard when controlling this API
+MANAGEMENT_TOKEN=
 EOF
 
 success ".env written to $INSTALL_DIR/.env"
@@ -211,12 +221,17 @@ success ".env written to $INSTALL_DIR/.env"
 info "Downloading requirements.txt …"
 curl -fsSL "$REPO_BASE/linux/requirements.txt" -o "$INSTALL_DIR/requirements.txt" 2>/dev/null || \
     cat > "$INSTALL_DIR/requirements.txt" <<'REQ'
-evdev>=3.1 ; sys_platform != 'win32'
+evdev>=1.7.1 ; sys_platform != 'win32'
 REQ
 
 # Copy source files
 info "Deploying source files …"
 mkdir -p "$INSTALL_DIR/src"
+
+# The old sources are removed first so that a re-install cannot leave
+# stale files behind.
+rm -rf "$INSTALL_DIR/src"
+mkdir -p "$INSTALL_DIR/src" "$INSTALL_DIR/tools"
 
 # Download source from GitHub
 TARBALL="https://github.com/xynnpg/bluetooth-bridge/archive/refs/heads/main.zip"
@@ -224,6 +239,10 @@ TMPZIP=$(mktemp /tmp/bridge-src.XXXXX.zip)
 if curl -fsSL "$TARBALL" -o "$TMPZIP" 2>/dev/null; then
     unzip -q "$TMPZIP" -d /tmp/
     cp -r /tmp/bluetooth-bridge-main/linux/src/* "$INSTALL_DIR/src/"
+    # The diagnostic collector (merges the Linux and the Windows trace).
+    if [[ -d /tmp/bluetooth-bridge-main/tools ]]; then
+        cp -r /tmp/bluetooth-bridge-main/tools/* "$INSTALL_DIR/tools/"
+    fi
     rm -rf /tmp/bluetooth-bridge-main
 fi
 rm -f "$TMPZIP"
@@ -233,6 +252,9 @@ REPO_LOCAL="/home/xynnpg/Projects/bluetooth-bridge"
 if [[ -d "$REPO_LOCAL/linux/src" ]] && [[ ! -f "$INSTALL_DIR/src/main.py" ]]; then
     warn "GitHub download failed — using local repo files."
     cp -r "$REPO_LOCAL/linux/src/"* "$INSTALL_DIR/src/"
+    if [[ -d "$REPO_LOCAL/tools" ]]; then
+        cp -r "$REPO_LOCAL/tools/"* "$INSTALL_DIR/tools/"
+    fi
 fi
 
 # ── 5. Bluetooth check ────────────────────────────────────────────────────────
@@ -415,6 +437,8 @@ echo ""
 success "Installed to:     $INSTALL_DIR"
 success "Container:        xbox-bridge (Docker)"
 success "Windows target:   $PC_HOST:$EXTERNAL_PORT"
+success "Log:              $INSTALL_DIR/xbox-bridge.log"
+success "Input trace:      $INSTALL_DIR/input-trace.log"
 echo ""
 echo -e "${YELLOW}  On your Windows PC, make sure the app is running, then play!${RESET}"
 echo ""

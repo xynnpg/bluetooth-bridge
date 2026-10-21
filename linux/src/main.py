@@ -21,6 +21,7 @@ import time
 
 import evdev
 
+from . import trace
 from .bluetooth import ensure_paired, get_battery_pct
 from .controller import (
     PAYLOAD_SIZE, BATTERY_UNKNOWN, build_abs_info, find_controller,
@@ -28,7 +29,11 @@ from .controller import (
 )
 from .discovery import DiscoveryListener
 from .network import TCPStreamer
-from .rumble import RumbleWriter, find_hidraw_by_mac, find_hidraw_for
+from .management import ManagementServer
+from .rumble import (
+    RumbleWriter, find_hidraw_by_mac, find_hidraw_for,
+    is_force_feedback_available,
+)
 
 logger = logging.getLogger("main")
 
@@ -45,10 +50,14 @@ class BridgeApp:
         self._rumble = RumbleWriter()
         self._rumble_lock = threading.Lock()
         self._last_rumble = (0, 0)
+        # Input-diagnostic logging state (used by _maybe_log_input)
+        self._last_input_log = 0.0
+        self._last_input_sig: tuple | None = None
         self._start_time = time.monotonic()
         self._bt_thread: threading.Thread | None = None
         self._battery_thread: threading.Thread | None = None
         self._battery_state_lock = threading.Lock()
+        self._management: ManagementServer | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -76,6 +85,14 @@ class BridgeApp:
             on_recv_packet=self._on_recv_packet,
         )
         self._tcp.start()
+
+        self._management = ManagementServer(
+            self,
+            host=os.getenv("MANAGEMENT_HOST", "0.0.0.0"),
+            port=int(os.getenv("MANAGEMENT_PORT", "9988")),
+            config_dir=os.getenv("MANAGEMENT_CONFIG_DIR", "/config"),
+        )
+        self._management.start()
 
         # 3b — Battery poller (background thread, 1 Hz).
         # Many kernels don't surface battery state via EV_MSC, so we also
@@ -106,6 +123,8 @@ class BridgeApp:
 
         logger.info("Shutting down …")
         self._tcp.stop()
+        if self._management:
+            self._management.stop()
         self._rumble.close()
 
     # ------------------------------------------------------------------
@@ -138,6 +157,8 @@ class BridgeApp:
                     self._state.controller_name = self._device.name or ""
                 logger.info("Controller device: %s (%s)",
                             self._device.path, self._device.name)
+                trace.event("DEVICE open %s (%s)", self._device.path,
+                            self._device.name)
                 self._open_rumble()
                 return
             except RuntimeError:
@@ -151,17 +172,46 @@ class BridgeApp:
         self._reconnect_device()
 
     def _open_rumble(self) -> None:
-        """Locate and open the hidraw node that backs the current evdev device."""
+        """Locate and open the rumble backend for the current evdev device.
+
+        Order of preference:
+
+        1. **hidraw sibling** — works for USB controllers and most BT
+           controllers on kernels that create a hidraw node per input
+           device.  We can write the controller-specific output report
+           directly.
+        2. **MAC-keyed hidraw fallback** — when the device tree link is
+           missing, search all hidraw nodes by MAC.
+        3. **Linux Force-Feedback** — Bluetooth-only Xbox Wireless
+           controllers do not create a hidraw sibling; the kernel
+           exposes ``FF_RUMBLE`` on the input device instead.  Use the
+           generic FF API.
+        4. **No rumble** — log a warning and let the rest of the bridge
+           continue.
+        """
         hidraw = find_hidraw_for(self._device.path)
         if not hidraw and self._controller_mac:
             hidraw = find_hidraw_by_mac(self._controller_mac)
-        if hidraw:
-            with self._rumble_lock:
-                self._rumble.set_device(hidraw)
-        else:
+
+        with self._rumble_lock:
+            if hidraw:
+                if self._rumble.set_device(hidraw):
+                    return
+                # hidraw was found but could not be opened — fall
+                # through to try the FF path on the input device.
+                logger.warning("hidraw %s present but unusable; "
+                               "falling back to FF rumble", hidraw)
+
+            if is_force_feedback_available(self._device.path):
+                if self._rumble.set_device(self._device.path):
+                    return
+                logger.warning("FF rumble present on %s but unusable",
+                               self._device.path)
+
             logger.warning(
-                "No hidraw node found for %s — vibration disabled. "
-                "Mount /dev/hidraw into the container to enable it.",
+                "No rumble backend available for %s — vibration disabled. "
+                "If the controller is USB-attached, ensure the container "
+                "can see /dev/hidraw* in RW mode.",
                 self._device.path,
             )
 
@@ -177,14 +227,42 @@ class BridgeApp:
             return
         try:
             state = read_next_state(self._device, self._abs_info, self._state)
+            # The controller may have powered off or the Bluetooth link may
+            # have dropped: the kernel then removes the device node and no
+            # further events arrive.  Release everything before we go
+            # looking for the device again, otherwise the last state (with
+            # the buttons that were held) would be reported forever.
+            if not self._device_present():
+                logger.warning("Controller device %s disappeared — "
+                               "releasing all inputs", self._device.path)
+                trace.event("DEVICE LOST %s — releasing all inputs",
+                            self._device.path)
+                state.release_all()
+                self._maybe_log_input(state)
+                try:
+                    self._tcp.send(state.to_bytes())
+                except Exception:
+                    pass
+                self._reconnect_device()
+                return
+            # Log trigger / stick changes at INFO so the user can verify
+            # in the bridge log what values the controller is actually
+            # reporting.  Throttled so we don't spam at 60 Hz.
+            self._maybe_log_input(state)
             # Apply host-driven rumble to the controller
             self._maybe_rumble(state)
             if self._tcp.send(state.to_bytes()):
                 return  # sent ok
-            # If send failed, sleep and retry until reconnected
-            time.sleep(0.5)
+            # The frame was lost (the peer is gone or the link stalled).
+            # Every frame is an authoritative snapshot, so the next one
+            # carries the same state — including the release of a button
+            # that was just let go of.
+            time.sleep(0.1)
         except OSError as exc:
             logger.error("Device read error: %s", exc)
+            # The device is gone (powered off / Bluetooth link dropped):
+            # let go of everything before we go looking for it again.
+            self._release_inputs()
             self._reconnect_device()
         except AttributeError as exc:
             # Device handle vanished (e.g. controller was unplugged) — treat
@@ -197,6 +275,46 @@ class BridgeApp:
             # visible but not alarming.
             logger.warning("Poll iteration error (swallowed): %s", exc)
 
+    def _device_present(self) -> bool:
+        """True while the evdev node of the controller still exists.
+
+        The kernel removes the node when the controller powers off or the
+        Bluetooth link drops.  A missing node means no further events will
+        arrive, so the state has to be released explicitly.
+
+        When /dev/input is not visible at all (e.g. the container has no
+        input devices mounted) the answer is unknown — assume the device is
+        still there and let the read error deal with it.
+        """
+        try:
+            path = self._device.path
+        except AttributeError:
+            return True
+        try:
+            if os.path.exists(path):
+                return True
+            if not os.path.isdir(os.path.dirname(path)):
+                return True     # cannot tell — no input devices visible
+        except OSError:
+            return True
+        return False
+
+    def _release_inputs(self) -> None:
+        """Release every button and send the neutral state to the PC.
+
+        Without this the last known state (with the buttons that were
+        held when the controller disappeared) would keep being reported
+        and the game would hold those buttons forever.
+        """
+        state = self._state
+        if state is None:
+            return
+        state.release_all()
+        try:
+            self._tcp.send(state.to_bytes())
+        except Exception as exc:
+            logger.debug("Could not send the released state: %s", exc)
+
     def _maybe_rumble(self, state) -> None:
         with self._state_lock:
             rl, rr = state.rumble_left, state.rumble_right
@@ -205,6 +323,35 @@ class BridgeApp:
         self._last_rumble = (rl, rr)
         with self._rumble_lock:
             self._rumble.apply(rl, rr)
+
+    def _maybe_log_input(self, state) -> None:
+        """Log trigger / stick / button changes at INFO for live diagnosis.
+
+        Throttled to at most one line per 200 ms so the log doesn't get
+        flooded at 60 Hz.  The values printed here are exactly what
+        goes on the wire to the Windows side.
+        """
+        now = time.monotonic()
+        if now - self._last_input_log < 0.2:
+            return
+        sig = (
+            state.lt, state.rt,
+            state.lthumb_x, state.lthumb_y,
+            state.rthumb_x, state.rthumb_y,
+            state.buttons_low, state.buttons_high,
+        )
+        if sig == self._last_input_sig:
+            return
+        self._last_input_sig = sig
+        self._last_input_log = now
+        logger.info(
+            "input: LT=%3d RT=%3d | LX=%5d LY=%5d | RX=%5d RY=%5d | "
+            "bl=0x%02x bh=0x%02x",
+            state.lt, state.rt,
+            state.lthumb_x, state.lthumb_y,
+            state.rthumb_x, state.rthumb_y,
+            state.buttons_low, state.buttons_high,
+        )
 
     def _rumble_apply_loop(self) -> None:
         """20 Hz loop that applies rumble values from the shared state.
@@ -329,6 +476,7 @@ class BridgeApp:
                 self._state  = new_state
                 logger.info("Controller reconnected at %s (attempt %d)",
                             dev.path, attempt)
+                trace.event("DEVICE reopen %s (attempt %d)", dev.path, attempt)
                 self._open_rumble()
                 return
             except RuntimeError:

@@ -14,6 +14,8 @@ import struct
 import threading
 import time
 
+from . import trace
+
 logger = logging.getLogger("network")
 
 _PAYLOAD_SIZE = 54
@@ -38,19 +40,28 @@ class TCPStreamer:
     packet (< 54 bytes) is dropped, a PING is dropped silently.
     """
 
-    def __init__(self, host: str, port: int, on_disconnect=None, on_recv_packet=None):
+    def __init__(self, host: str, port: int, on_disconnect=None, on_recv_packet=None,
+                 send_timeout_s: float = 0.25):
         self.host = host
         self.port = port
         self.on_disconnect = on_disconnect
         # Called with each 54-byte v2 packet received from the PC.
         # Implementations should be fast and non-blocking.
         self.on_recv_packet = on_recv_packet
+        # Bound the time we block on sendall() so a stalled peer cannot
+        # queue up evdev events on the producer side.
+        self._send_timeout_s = send_timeout_s
         self._sock: socket.socket | None = None
+        self._sock_generation = 0
         self._lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
         self._recv_thread: threading.Thread | None = None
         self._latency_warning_issued = False
+        # Trace state: the last button/D-pad signature that was sent and
+        # the time of the last trace line (for the periodic heartbeat).
+        self._trace_sig: tuple | None = None
+        self._trace_at = 0.0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -61,15 +72,22 @@ class TCPStreamer:
         self._thread = threading.Thread(target=self._run, name="TCPStreamer", daemon=True)
         self._thread.start()
 
+    @property
+    def connected(self) -> bool:
+        with self._lock:
+            return self._sock is not None
+
     def stop(self) -> None:
         self._running = False
-        if self._sock:
+        with self._lock:
+            sock = self._sock
+            self._sock = None
+        if sock:
             try:
-                self._sock.shutdown(socket.SHUT_RDWR)
+                sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-            self._sock.close()
-            self._sock = None
+            sock.close()
         if self._thread:
             self._thread.join(timeout=3)
         if self._recv_thread:
@@ -89,17 +107,72 @@ class TCPStreamer:
         # socket; if a partial sendall() under congestion interleaves with
         # a PING packet, the byte stream is permanently misaligned and the
         # Windows receiver can false-re-sync onto garbage (ghost inputs).
-        with self._lock:
+        #
+        # The lock is acquired with a timeout: the keepalive may be stuck
+        # in a write while the peer stopped reading, and the input loop
+        # must not be blocked by it.  A frame that could not be sent is not
+        # lost — every frame is an authoritative snapshot, so the next
+        # heartbeat carries the same state.
+        if not self._lock.acquire(timeout=self._send_timeout_s):
+            logger.warning("Send skipped — the connection is busy")
+            return False
+        try:
             sock = self._sock
             if sock is None:
                 return False
+            # Apply a short per-send timeout so a stalled peer (slow
+            # WiFi, blocked Windows-side loop, etc.) cannot queue up
+            # evdev events on the producer side.  The socket is restored
+            # to blocking mode in the `finally` to keep the keepalive
+            # thread unaffected.
+            sock.settimeout(self._send_timeout_s)
             try:
                 sock.sendall(data)
+                if data[10] or data[11] or data[12]:
+                    logger.debug("TX button frame: buttons=%s", data[10:13].hex())
+                self._trace_frame(data)
                 return True
+            except socket.timeout:
+                # The peer stopped reading and only *part* of the frame
+                # reached the wire.  The stream is now permanently
+                # misaligned: every following frame would be decoded by
+                # the receiver at the wrong offset and turned into ghost
+                # button presses.  The only safe recovery is to drop the
+                # connection and start a fresh, aligned stream.
+                logger.warning("Send timed out after %.0f ms — dropping the "
+                               "connection to avoid a corrupted frame stream",
+                               self._send_timeout_s * 1000)
+                trace.event("SEND TIMEOUT after %.0f ms — dropping the connection",
+                            self._send_timeout_s * 1000)
             except (BrokenPipeError, ConnectionResetError, OSError) as exc:
                 logger.warning("Send failed: %s", exc)
-        self._mark_disconnected()
+                trace.event("SEND FAILED: %s", exc)
+            finally:
+                try:
+                    sock.settimeout(None)
+                except OSError:
+                    pass
+        finally:
+            self._lock.release()
+        # NOTE: _mark_disconnected() must not be called while the lock is
+        # held — it takes the same (non-reentrant) lock.
+        self._mark_disconnected(sock)
         return False
+
+    def _trace_frame(self, data: bytes) -> None:
+        """Write a trace line for a frame that was sent.
+
+        A line is written whenever the button / D-pad state changes and
+        once per second otherwise, so the trace shows every transition
+        without flooding the file.
+        """
+        sig = (data[10], data[11], data[12])
+        now = time.monotonic()
+        if sig == self._trace_sig and now - self._trace_at < 1.0:
+            return
+        self._trace_sig = sig
+        self._trace_at = now
+        trace.state("TX", data[10], data[11], data[12], data[8], data[9])
 
     # ------------------------------------------------------------------
     # Internal reconnect loop + keepalive
@@ -131,7 +204,10 @@ class TCPStreamer:
 
         with self._lock:
             self._sock = sock
+            self._sock_generation += 1
+            generation = self._sock_generation
         logger.info("Connected to %s:%s", self.host, self.port)
+        trace.event("CONNECT to %s:%s", self.host, self.port)
 
         # Start the receive thread for this connection
         self._recv_thread = threading.Thread(
@@ -151,9 +227,23 @@ class TCPStreamer:
                         if self._sock is not sock or not self._running:
                             break
                         try:
+                            # The same bound as for the state frames: a
+                            # peer that stopped reading must not block the
+                            # writer, and a half-written PING would
+                            # misalign the stream.
+                            sock.settimeout(self._send_timeout_s)
                             sock.sendall(_PING_PAYLOAD)
+                        except socket.timeout:
+                            logger.warning("Keepalive PING timed out — "
+                                           "dropping the connection")
+                            break
                         except OSError:
                             break
+                        finally:
+                            try:
+                                sock.settimeout(None)
+                            except OSError:
+                                pass
                     last_ping = now
                 time.sleep(0.1)
             except Exception:
@@ -161,6 +251,7 @@ class TCPStreamer:
 
         # Stop the recv thread and tear down
         with self._lock:
+            active = self._sock is sock and self._sock_generation == generation
             if self._sock is sock:
                 self._sock = None
         try:
@@ -171,7 +262,8 @@ class TCPStreamer:
         if self._recv_thread:
             self._recv_thread.join(timeout=1)
             self._recv_thread = None
-        self._notify_disconnect()
+        if active:
+            self._notify_disconnect()
 
     def _recv_loop(self, sock: socket.socket) -> None:
         """Drain 54-byte v2 packets until the socket closes.
@@ -184,7 +276,12 @@ class TCPStreamer:
         buf = bytearray()
         try:
             while self._running:
-                chunk = sock.recv(_PAYLOAD_SIZE * 4)
+                try:
+                    chunk = sock.recv(_PAYLOAD_SIZE * 4)
+                except socket.timeout:
+                    # The socket timeout is shared with the writer; a
+                    # timeout here only means "no data yet".
+                    continue
                 if not chunk:
                     break  # peer closed
                 buf.extend(chunk)
@@ -193,6 +290,7 @@ class TCPStreamer:
                     pkt = bytes(buf[:_PAYLOAD_SIZE])
                     del buf[:_PAYLOAD_SIZE]
                     if pkt == _PING_PAYLOAD:
+                        logger.debug("RX ping from Windows")
                         continue  # keepalive — ignore
                     cb = self.on_recv_packet
                     if cb is not None:
@@ -205,12 +303,26 @@ class TCPStreamer:
         except Exception as exc:
             logger.debug("recv_loop: %s", exc)
 
-    def _mark_disconnected(self) -> None:
+    def _mark_disconnected(self, sock: socket.socket) -> None:
+        active = False
         with self._lock:
-            self._sock = None
+            if self._sock is sock:
+                self._sock = None
+                active = True
+        if not active:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
         self._notify_disconnect()
 
     def _notify_disconnect(self) -> None:
+        trace.event("DISCONNECT from %s:%s", self.host, self.port)
         cb = self.on_disconnect
         if cb:
             cb()

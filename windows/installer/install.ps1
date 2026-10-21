@@ -170,9 +170,27 @@ if (-not $isIrmMode -and -not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
     $localReq    = Join-Path $repoRoot "windows\requirements.txt"
 
     if (Test-Path $localAppSrc) {
-        Copy-Item -Recurse $localAppSrc "$INSTALL_DIR\src\" -Force
+        # The old sources are removed first: Copy-Item -Recurse copies a
+        # directory *into* an existing one, which would nest the new files
+        # in src\src\ on a re-install and break the imports.
+        if (Test-Path "$INSTALL_DIR\src") {
+            Remove-Item "$INSTALL_DIR\src" -Recurse -Force
+        }
+        New-Item -ItemType Directory -Force -Path "$INSTALL_DIR\src" | Out-Null
+        Copy-Item -Recurse "$localAppSrc\*" "$INSTALL_DIR\src\" -Force
+        if (Test-Path "$INSTALL_DIR\src\__pycache__") {
+            Remove-Item "$INSTALL_DIR\src\__pycache__" -Recurse -Force
+        }
         if (Test-Path $localReq) {
             Copy-Item $localReq "$INSTALL_DIR\" -Force
+        }
+        $localTools = Join-Path $repoRoot "tools"
+        if (Test-Path $localTools) {
+            if (Test-Path "$INSTALL_DIR\tools") {
+                Remove-Item "$INSTALL_DIR\tools" -Recurse -Force
+            }
+            New-Item -ItemType Directory -Force -Path "$INSTALL_DIR\tools" | Out-Null
+            Copy-Item -Recurse "$localTools\*" "$INSTALL_DIR\tools\" -Force
         }
         Write-Info "Deployed from local repo: $repoRoot"
         $localDeployed = $true
@@ -203,9 +221,29 @@ if (-not $localDeployed) {
             throw "windows\src not found inside downloaded archive"
         }
 
-        Copy-Item $winSrc "$INSTALL_DIR\src\" -Recurse -Force
+        # Remove the old sources first — Copy-Item -Recurse copies a
+        # directory *into* an existing one, which would nest the new files
+        # in src\src\ on a re-install and break the imports.
+        if (Test-Path "$INSTALL_DIR\src") {
+            Remove-Item "$INSTALL_DIR\src" -Recurse -Force
+        }
+        New-Item -ItemType Directory -Force -Path "$INSTALL_DIR\src" | Out-Null
+        Copy-Item -Recurse "$winSrc\*" "$INSTALL_DIR\src\" -Force
+        if (Test-Path "$INSTALL_DIR\src\__pycache__") {
+            Remove-Item "$INSTALL_DIR\src\__pycache__" -Recurse -Force
+        }
         if (Test-Path $winReq) {
             Copy-Item $winReq "$INSTALL_DIR\" -Force
+        }
+
+        # The diagnostic collector (merges the Windows and the Linux trace).
+        $winTools = Join-Path $extractedRoot.FullName "tools"
+        if (Test-Path $winTools) {
+            if (Test-Path "$INSTALL_DIR\tools") {
+                Remove-Item "$INSTALL_DIR\tools" -Recurse -Force
+            }
+            New-Item -ItemType Directory -Force -Path "$INSTALL_DIR\tools" | Out-Null
+            Copy-Item -Recurse "$winTools\*" "$INSTALL_DIR\tools\" -Force
         }
 
         Remove-Item $tmpDir -Recurse -Force
@@ -323,6 +361,7 @@ try {
         --collect-all PIL `
         --collect-all flask `
         --hidden-import waitress `
+        --paths "$INSTALL_DIR" `
         "$INSTALL_DIR\src\main.py" 2>$null | Out-Null
     Write-Success "Built native GUI executable: $exePath"
 } catch {
@@ -350,12 +389,15 @@ open_on_launch  = false
 auto_refresh_ms = 750
 
 [controller]
-rumble_enabled        = true
-low_battery_warn_pct  = 15
-deadzone_stick        = 15
-deadzone_trigger      = 1
-invert_left_y         = false
-invert_right_y        = false
+rumble_enabled                = true
+low_battery_warn_pct          = 15
+deadzone_stick                = 15
+deadzone_trigger              = 1
+invert_left_y                 = false
+invert_right_y                = false
+battery_display_enabled       = true
+performance_warning_enabled   = true
+performance_warning_ms        = 180
 
 [tray]
 show_battery = true
@@ -363,6 +405,10 @@ show_battery = true
 [network]
 discovery_port       = 9876
 keepalive_timeout_s  = 6.0
+
+[linux]
+management_port = 9988
+management_token =
 "@, $utf8NoBom)
 
 # Fallback VBS launcher if needed
@@ -461,6 +507,8 @@ Write-Host "  On your Linux machine, run:" -ForegroundColor Yellow
 Write-Host "  curl -fsSL https://raw.githubusercontent.com/xynnpg/bluetooth-bridge/main/linux/install.sh | bash -s $localIp" -ForegroundColor Yellow
 Write-Host ""
 Write-Info "Logs:      $INSTALL_DIR\bluetooth-bridge.log"
+Write-Info "Trace:     $env:LOCALAPPDATA\bluetooth_bridge\input-trace.log"
+Write-Info "Collect:   python $INSTALL_DIR\tools\collect_input_trace.py --linux <LINUX_IP>"
 Write-Info "Config:    $INSTALL_DIR\config.ini"
 Write-Info "Uninstall: delete $INSTALL_DIR and the Start Menu shortcut"
 Write-Host ""

@@ -1,4 +1,4 @@
-"""Reads Xbox controller input via evdev and produces 32-byte state packets."""
+"""Reads Xbox controller input via evdev and produces 54-byte state packets."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 
 import evdev
 
+from . import trace
+
 logger = logging.getLogger("controller")
 
 # Wire protocol version
@@ -17,6 +19,24 @@ PROTO_VERSION   = 0x02
 PAYLOAD_SIZE    = 54
 BATTERY_UNKNOWN = 0xFF
 NAME_FIELD_LEN  = 16
+
+# Byte offset of the frame checksum (last byte of the reserved area).
+CHECKSUM_OFFSET = 52
+# Number of bytes the checksum is computed over (offsets 0..51).
+CHECKSUM_SPAN   = 52
+
+# flags byte bits
+FLAG_CHARGING   = 0x01   # the battery value is meaningful
+FLAG_BATTERY_OK = 0x02   # a battery percentage is known
+FLAG_STREAMING  = 0x04   # "I keep streaming the state even when idle"
+FLAG_CHECKSUM   = 0x08   # "byte 52 holds a valid checksum"
+
+#: How long the reader waits for new events before handing the current
+#: state back anyway.  Every frame is a complete, authoritative snapshot of
+#: the controller, so streaming one every 50 ms means a frame that was lost
+#: in transit is corrected by the next one instead of latching a button
+#: forever.
+IDLE_HEARTBEAT_S = 0.05
 
 # ---------------------------------------------------------------------------
 # EVDEV button & abs-code mappings for Xbox One / Xbox Series controllers
@@ -55,6 +75,32 @@ _ABS_AXES: dict[int, str] = {
 # Hat switch (d-pad) axis codes
 _HATX = evdev.ecodes.ABS_HAT0X
 _HATY = evdev.ecodes.ABS_HAT0Y
+
+# Human readable names for the trace log.
+_BUTTON_NAMES: dict[int, str] = {
+    evdev.ecodes.BTN_SOUTH:   "A",
+    evdev.ecodes.BTN_EAST:    "B",
+    evdev.ecodes.BTN_NORTH:   "X",
+    evdev.ecodes.BTN_WEST:    "Y",
+    evdev.ecodes.BTN_TL:      "LB",
+    evdev.ecodes.BTN_TR:      "RB",
+    evdev.ecodes.BTN_SELECT:  "Back",
+    evdev.ecodes.BTN_START:   "Start",
+    evdev.ecodes.BTN_THUMBL:  "L3",
+    evdev.ecodes.BTN_THUMBR:  "R3",
+    evdev.ecodes.BTN_MODE:    "Guide",
+    evdev.ecodes.BTN_TL2:     "LT",
+    evdev.ecodes.BTN_TR2:     "RT",
+    evdev.ecodes.BTN_DPAD_UP:    "DPadUp",
+    evdev.ecodes.BTN_DPAD_DOWN:  "DPadDown",
+    evdev.ecodes.BTN_DPAD_LEFT:  "DPadLeft",
+    evdev.ecodes.BTN_DPAD_RIGHT: "DPadRight",
+}
+
+# The last value that was written to the trace for an axis — a stick
+# reports hundreds of events per second, only the interesting ones are
+# logged.
+_last_traced_axis: dict[str, int] = {}
 
 # Axes that use _norm_stick (signed → unsigned 0-65535).
 # Everything else in _ABS_AXES uses _norm_trigger (0-based → 0-255).
@@ -110,6 +156,7 @@ class ControllerState:
     _hat_x: int = field(default=0, repr=False)
     _hat_y: int = field(default=0, repr=False)
 
+
     def to_bytes(self) -> bytes:
         """Serialise to a 54-byte v2 wire packet (little-endian).
 
@@ -126,19 +173,33 @@ class ControllerState:
         12       1    dpad bitmask (UP=0x01 RIGHT=0x02 DOWN=0x04 LEFT=0x08)
         13       1    proto      uint8 (0x02)
         14       1    battery    uint8 (0-100, 0xFF=unknown)
-        15       1    flags      uint8 (bit0=charging, bit1=battery_valid)
+        15       1    flags      uint8 (bit0=charging, bit1=battery_valid,
+                                           bit2=idle heartbeat,
+                                           bit3=checksum present)
         16       1    rumble_l   uint8
         17       1    rumble_r   uint8
         18-23   6    mac        6 raw bytes (AA BB CC DD EE FF)
         24-39  16    name       ASCII, NUL-padded
-        40-53  14    padding    0x00
+        40-51  12    reserved   0x00
+        52      1    checksum   sum(bytes 0..51) & 0xFF
+                              (announced by flag bit 3 — the value may be 0)
+        53      1    reserved   0x00
         """
         dpad = _dpad_bitmask(self._hat_x, self._hat_y)
         flags = 0
         if self.charging:
-            flags |= 0x01
+            flags |= FLAG_CHARGING
         if self.battery != BATTERY_UNKNOWN:
-            flags |= 0x02
+            flags |= FLAG_BATTERY_OK
+        # "I keep streaming the state even when nothing happens" — the PC
+        # uses this to decide whether it may watch the input stream with a
+        # watchdog (an older sender only reports when the controller is
+        # used, so a held button must not be released by the PC).
+        flags |= FLAG_STREAMING
+        # "byte 52 holds a valid checksum" — the receiver verifies every
+        # frame, so a frame that was cut short on the wire can never be
+        # mistaken for controller input.
+        flags |= FLAG_CHECKSUM
         mac_bytes = _mac_to_bytes(self.controller_mac)
         name_bytes = _name_to_bytes(self.controller_name, NAME_FIELD_LEN)
         pkt = struct.pack(
@@ -159,17 +220,50 @@ class ControllerState:
             self.rumble_right & 0xFF,
         )
         pkt += mac_bytes + name_bytes
-        pkt += b"\x00" * 14  # trailing pad
+        pkt += b"\x00" * 12                   # reserved (40..51)
+        pkt += bytes((_frame_checksum(pkt),))  # checksum (52)
+        pkt += b"\x00"                         # reserved (53)
         assert len(pkt) == PAYLOAD_SIZE, f"packet is {len(pkt)} bytes, expected {PAYLOAD_SIZE}"
         return pkt
 
+    def release_all(self) -> None:
+        """Let go of everything — used when the controller is gone.
+
+        When the controller powers off or the Bluetooth link drops, the
+        kernel stops sending events and the last known state would be
+        reported forever: the game would keep seeing the button that was
+        pressed when the link died.  Resetting the state makes the next
+        frame release every button.
+        """
+        self.lthumb_x = 32768
+        self.lthumb_y = 32768
+        self.rthumb_x = 32768
+        self.rthumb_y = 32768
+        self.lt = 0
+        self.rt = 0
+        self.buttons_low = 0
+        self.buttons_high = 0
+        self._hat_x = 0
+        self._hat_y = 0
+
     @staticmethod
     def from_bytes(data: bytes) -> "ControllerState | None":
-        """Deserialise a 54-byte v2 packet (inverse of to_bytes)."""
-        if data[:1] == b"\xff" or data == b"\xff" * PAYLOAD_SIZE:
+        """Deserialise a 54-byte v2 packet (inverse of to_bytes).
+
+        Returns ``None`` for a keepalive PING and for a frame that does not
+        carry a valid checksum — a frame that was cut short on the wire
+        must never be decoded as controller input.
+        """
+        if len(data) >= PAYLOAD_SIZE and data[:PAYLOAD_SIZE] == b"\xff" * PAYLOAD_SIZE:
             return None  # keepalive PING
         if len(data) < 18:
             return None
+        if len(data) >= PAYLOAD_SIZE:
+            flags = data[15]
+            if flags & FLAG_CHECKSUM:
+                if data[CHECKSUM_OFFSET] != (
+                        sum(data[:CHECKSUM_SPAN]) & 0xFF):
+                    return None      # corrupted / misaligned frame
         s = ControllerState()
         (s.lthumb_x, s.lthumb_y, s.rthumb_x, s.rthumb_y,
          s.lt, s.rt, s.buttons_low, s.buttons_high,
@@ -215,6 +309,17 @@ def _bytes_to_name(b: bytes) -> str:
         return b.rstrip(b"\x00").decode("ascii", errors="replace")
     except Exception:
         return ""
+
+
+def _frame_checksum(data: bytes) -> int:
+    """Additive checksum over the first CHECKSUM_SPAN bytes of a frame.
+
+    The receiver uses it to tell a real frame apart from a window that is
+    shifted because a previous frame was cut short on the wire.  Whether a
+    frame carries a checksum is announced by flag bit 3, not by the value
+    of this byte — a checksum of 0 is a perfectly normal checksum.
+    """
+    return sum(data[:CHECKSUM_SPAN]) & 0xFF
 
 
 def _dpad_bitmask(hat_x: int, hat_y: int) -> int:
@@ -289,8 +394,8 @@ def build_abs_info(device: evdev.InputDevice) -> dict:
 
 def _norm_stick(val: int, abs_info) -> int:
     """Scale a signed evdev stick axis to 0-65535 (unsigned wire format)."""
-    lo   = abs_info.min
-    hi   = abs_info.max
+    lo   = abs_info.min if abs_info is not None else -32768
+    hi   = abs_info.max if abs_info is not None else 32767
     span = hi - lo
     if span <= 0:
         return 32768
@@ -305,7 +410,9 @@ def _norm_trigger(val: int, abs_info) -> int:
     the trigger appears permanently "stuck at max" until the raw value drops
     below 255.
     """
-    lo   = abs_info.min if abs_info is not None else 0
+    # A signed axis (-32768..32767) would map a resting value of 0 to
+    # "half pressed", so the lower end is clamped to 0.
+    lo   = max(0, abs_info.min) if abs_info is not None else 0
     hi   = abs_info.max if abs_info is not None else 1023  # safe Xbox BT default
     span = hi - lo
     if span <= 0:
@@ -344,27 +451,49 @@ def read_next_state(
     device:   evdev.InputDevice,
     abs_info: dict,
     state:    ControllerState,
+    timeout:  float = IDLE_HEARTBEAT_S,
 ) -> ControllerState:
     """Block until the next EV_SYN, update *state* in-place, return it.
 
     The caller must pass the SAME state object on every call so that
     axis values and button states carry over between event batches.
+
+    Uses ``select()`` on the underlying fd to block in the kernel rather
+    than spin-polling ``read_one()``: the spin-loop version pegs a CPU
+    core at 100% when the controller is idle and increases BT-stack
+    latency.
+
+    Two details matter for correctness:
+
+    * **Every pending event is drained.**  The kernel hands out events in
+      batches that end with ``SYN_REPORT``; reading a single event per
+      ``select()`` throws the rest of the batch away — including button
+      *releases*, which is exactly how "I let go of the button and it is
+      still held" happens.
+
+    * **The state is returned even when nothing happens.**  After *timeout*
+      seconds without a new event the current state is handed back, so the
+      caller keeps streaming authoritative frames.  A frame that was lost in
+      transit is then corrected by the next one instead of latching a
+      button forever.
     """
+    fd = device.fd
+    deadline = time.monotonic() + timeout
     while True:
-        # Block on the fd instead of busy-spinning.  python-evdev opens the
-        # device with O_NONBLOCK, so read_one() returns None immediately and
-        # a naive loop pegs a full CPU core — which starves the TCP recv and
-        # rumble-apply threads and adds ~hundreds of ms of input/vibration
-        # latency.  select() parks the thread until an event is ready.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Idle heartbeat — the state is unchanged but still current.
+            return state
+
         try:
-            ready, _, _ = select.select([device.fd], [], [], 1.0)
+            r, _, _ = select.select([fd], [], [], remaining)
         except (OSError, ValueError) as exc:
             raise OSError(f"device select failed: {exc}")
-        if not ready:
-            continue  # 1s timeout — re-check _running / device state
+        if not r:
+            continue
 
-        # Drain the complete queue snapshot. Reading only one event per call
-        # can overrun evdev during a busy input burst and lose button releases.
+        # Drain the complete queue snapshot: one event per select() loses
+        # the remainder of the batch.
         while True:
             event = device.read_one()
             if event is None:
@@ -372,7 +501,9 @@ def read_next_state(
 
             if event.type == evdev.ecodes.EV_SYN:
                 if event.code == evdev.ecodes.SYN_DROPPED:
-                    _resync_keys(state, device)
+                    # The kernel dropped events — our idea of what is held
+                    # is stale, so re-read it from the device.
+                    _resync_keys(state, device, abs_info)
                 elif event.code == evdev.ecodes.SYN_REPORT:
                     return state
                 continue
@@ -383,28 +514,122 @@ def read_next_state(
                 _update_key(state, event)
 
 
+def _current_axis_values(device) -> dict:
+    """Read the *current* value of every absolute axis from the device.
+
+    The kernel caches the axis values; after a ``SYN_DROPPED`` they are the
+    only trustworthy source for what the controller is holding (a pulled
+    trigger or a held D-pad direction produce no new events).
+
+    Three sources are tried, because the available API differs between
+    evdev wrappers:
+
+    1. ``device.absinfo(code)`` — a fresh ``EVIOCGABS`` per axis
+       (python-evdev).
+    2. ``device.state`` — the current ``(code, value)`` pairs.
+    3. ``device.capabilities()`` — may be stale or carry no value at all.
+    """
+    values: dict = {}
+
+    absinfo = getattr(device, "absinfo", None)
+    if callable(absinfo):
+        try:
+            caps = device.capabilities(absinfo=True)
+            fresh: dict = {}
+            for code, _info in caps.get(evdev.ecodes.EV_ABS, []):
+                fresh[code] = absinfo(code).value
+            if fresh:
+                return fresh
+        except Exception as exc:        # pragma: no cover - defensive
+            logger.debug("Could not read the axis values after SYN_DROPPED: %s", exc)
+
+    try:
+        for code, value in device.state:
+            values[code] = value
+        if values:
+            return values
+    except Exception as exc:            # pragma: no cover - defensive
+        logger.debug("Could not read the device state after SYN_DROPPED: %s", exc)
+
+    try:
+        caps = device.capabilities(absinfo=True)
+        for code, info in caps.get(evdev.ecodes.EV_ABS, []):
+            value = getattr(info, "value", None)
+            if value is not None:
+                values[code] = value
+    except Exception as exc:            # pragma: no cover - defensive
+        logger.debug("Could not read the axis capabilities after SYN_DROPPED: %s", exc)
+
+    return values
+
+
+def _resync_keys(state: ControllerState, device: evdev.InputDevice,
+                 abs_info: dict | None = None) -> None:
+    """Rebuild the state after evdev reported that events were lost.
+
+    ``SYN_DROPPED`` means the kernel threw events away, so the in-memory
+    state can be wrong — a button that was released while the events were
+    lost would stay latched forever and every following packet would keep
+    reporting it as pressed.  The kernel still knows what is held, so
+    re-read it from the device instead of trusting the stale state.
+
+    The digital buttons come from ``active_keys()``; the analog axes come
+    from the values the kernel caches for the device.
+    """
+    abs_info = abs_info or {}
+
+    state.buttons_low  = 0
+    state.buttons_high = 0
+
+    # The analog axes keep their last value unless the device can tell us
+    # the current one — zeroing them would report a held trigger or a held
+    # stick as released.
+    axes = _current_axis_values(device)
+    if axes:
+        if _HATX in axes:
+            state._hat_x = axes[_HATX]
+        if _HATY in axes:
+            state._hat_y = axes[_HATY]
+        for code, field_name in ((evdev.ecodes.ABS_BRAKE, "lt"),
+                                 (evdev.ecodes.ABS_GAS,   "rt")):
+            if code in axes:
+                setattr(state, field_name,
+                        _norm_trigger(axes[code], abs_info.get(code)))
+        for code, field_name in ((evdev.ecodes.ABS_X,  "lthumb_x"),
+                                 (evdev.ecodes.ABS_Y,  "lthumb_y"),
+                                 (evdev.ecodes.ABS_Z,  "rthumb_x"),
+                                 (evdev.ecodes.ABS_RZ, "rthumb_y")):
+            if code in axes:
+                setattr(state, field_name,
+                        _norm_stick(axes[code], abs_info.get(code)))
+
+    try:
+        held = device.active_keys()
+    except (OSError, AttributeError) as exc:
+        logger.warning("Could not resync controller buttons after SYN_DROPPED: %s", exc)
+        return
+
+    logger.warning("Resynced controller state after dropped events (%d keys held)",
+                   len(held))
+    trace.event("RESYNC after dropped events — %d keys held", len(held))
+    for code in held:
+        _update_key(state, _KeyEvent(code))
+
+
+class _KeyEvent:
+    """A synthetic evdev key event (used when re-reading the device state)."""
+
+    __slots__ = ("type", "code", "value")
+
+    def __init__(self, code: int, value: int = 1) -> None:
+        self.type  = evdev.ecodes.EV_KEY
+        self.code  = code
+        self.value = value
+
+
 # ---------------------------------------------------------------------------
 # Internal update helpers
 # ---------------------------------------------------------------------------
-
-def _resync_keys(state: ControllerState, device: evdev.InputDevice) -> None:
-    """Rebuild digital state after evdev reports that events were dropped."""
-    state.buttons_low = 0
-    state.buttons_high = 0
-    state._hat_x = 0
-    state._hat_y = 0
-    state.lt = 0
-    state.rt = 0
-    try:
-        for code in device.active_keys():
-            class _KeyEvent:
-                type = evdev.ecodes.EV_KEY
-                value = 1
-
-            _KeyEvent.code = code
-            _update_key(state, _KeyEvent())
-    except (OSError, AttributeError) as exc:
-        logger.warning("Could not resync controller buttons after SYN_DROPPED: %s", exc)
 
 def _update_abs(state: ControllerState, event, abs_info: dict) -> None:
     code = event.code
@@ -423,16 +648,28 @@ def _update_abs(state: ControllerState, event, abs_info: dict) -> None:
         else:
             # Trigger — scale from device range (often 0-1023) to 0-255
             new_val = _norm_trigger(val, ai)
-        logger.debug("ABS  code=%-4d %-12s raw=%-6d → %d",
-                     code, field_name, val, new_val)
+        # Axis events arrive at high frequency; logging every one blocks the
+        # evdev loop and turns directly into packet lag. Keep this opt-in.
+        logger.debug("ABS  code=%-4d %-12s raw=%-6d -> %d",
+                 code, field_name, val, new_val)
+        # A stick reports hundreds of events per second — only log the
+        # changes that matter for a diagnosis.
+        step = 8 if field_name in ("lt", "rt") else 1024
+        if abs(new_val - _last_traced_axis.get(field_name, -99999)) >= step:
+            _last_traced_axis[field_name] = new_val
+            trace.event("AXIS %-10s raw=%-7d -> %d", field_name, val, new_val)
         setattr(state, field_name, new_val)
         return
 
     if code == _HATX:
         logger.debug("HAT  X=%d", val)
+        if val != state._hat_x:
+            trace.event("DPAD x=%d y=%d", val, state._hat_y)
         state._hat_x = val
     elif code == _HATY:
         logger.debug("HAT  Y=%d", val)
+        if val != state._hat_y:
+            trace.event("DPAD x=%d y=%d", state._hat_x, val)
         state._hat_y = val
     elif code == evdev.ecodes.ABS_MISC:
         # Some Xbox firmware reports battery through ABS_MISC
@@ -466,6 +703,8 @@ def _update_key(state: ControllerState, event) -> None:
             if current == direction:
                 setattr(state, attr, 0)
         logger.debug("DPAD KEY code=%d val=%d", code, val)
+        trace.event("BTN %-8s %s", _BUTTON_NAMES.get(code, "DPad"),
+                    "press" if val else "release")
         return
 
     # --- Digital trigger fallback (some firmware sends key events instead of
@@ -473,11 +712,13 @@ def _update_key(state: ControllerState, event) -> None:
     if code == evdev.ecodes.BTN_TL2:
         state.lt = 255 if val else 0
         logger.debug("LT   digital val=%d", val)
+        trace.event("BTN %-8s %s", "LT", "press" if val else "release")
         return
 
     if code == evdev.ecodes.BTN_TR2:
         state.rt = 255 if val else 0
         logger.debug("RT   digital val=%d", val)
+        trace.event("BTN %-8s %s", "RT", "press" if val else "release")
         return
 
     # --- Thumbstick clicks (L3 / R3) in buttons_high -------------------------
@@ -485,12 +726,14 @@ def _update_key(state: ControllerState, event) -> None:
         mask = 1 << 0
         state.buttons_high = (state.buttons_high & ~mask & 0xFF) | (mask if val else 0)
         logger.debug("L3   val=%d", val)
+        trace.event("BTN %-8s %s", "L3", "press" if val else "release")
         return
 
     if code == evdev.ecodes.BTN_THUMBR:
         mask = 1 << 1
         state.buttons_high = (state.buttons_high & ~mask & 0xFF) | (mask if val else 0)
         logger.debug("R3   val=%d", val)
+        trace.event("BTN %-8s %s", "R3", "press" if val else "release")
         return
 
     # --- Guide / Xbox button in buttons_high ---------------------------------
@@ -498,6 +741,7 @@ def _update_key(state: ControllerState, event) -> None:
         mask = 1 << 2
         state.buttons_high = (state.buttons_high & ~mask & 0xFF) | (mask if val else 0)
         logger.debug("GUIDE val=%d", val)
+        trace.event("BTN %-8s %s", "Guide", "press" if val else "release")
         return
 
     # --- Regular face / shoulder / menu buttons in buttons_low ---------------
@@ -505,7 +749,10 @@ def _update_key(state: ControllerState, event) -> None:
         bit  = _BTN_MAP[code]
         mask = 1 << bit
         state.buttons_low = (state.buttons_low & ~mask & 0xFF) | (mask if val else 0)
-        logger.debug("BTN  bit=%d val=%d (code=%d)", bit, val, code)
+        logger.debug("BTN  bit=%d %s (code=%d)", bit,
+                "pressed" if val else "released", code)
+        trace.event("BTN %-8s %s", _BUTTON_NAMES.get(code, str(code)),
+                    "press" if val else "release")
         return
 
     # --- Unknown / unmapped — log so missing inputs are easy to identify ------
