@@ -243,6 +243,11 @@ if curl -fsSL "$TARBALL" -o "$TMPZIP" 2>/dev/null; then
     if [[ -d /tmp/bluetooth-bridge-main/tools ]]; then
         cp -r /tmp/bluetooth-bridge-main/tools/* "$INSTALL_DIR/tools/"
     fi
+    # The controller repair helper.
+    if [[ -f /tmp/bluetooth-bridge-main/linux/repair_controller.sh ]]; then
+        cp /tmp/bluetooth-bridge-main/linux/repair_controller.sh "$INSTALL_DIR/"
+        chmod +x "$INSTALL_DIR/repair_controller.sh"
+    fi
     rm -rf /tmp/bluetooth-bridge-main
 fi
 rm -f "$TMPZIP"
@@ -254,6 +259,10 @@ if [[ -d "$REPO_LOCAL/linux/src" ]] && [[ ! -f "$INSTALL_DIR/src/main.py" ]]; th
     cp -r "$REPO_LOCAL/linux/src/"* "$INSTALL_DIR/src/"
     if [[ -d "$REPO_LOCAL/tools" ]]; then
         cp -r "$REPO_LOCAL/tools/"* "$INSTALL_DIR/tools/"
+    fi
+    if [[ -f "$REPO_LOCAL/linux/repair_controller.sh" ]]; then
+        cp "$REPO_LOCAL/linux/repair_controller.sh" "$INSTALL_DIR/"
+        chmod +x "$INSTALL_DIR/repair_controller.sh"
     fi
 fi
 
@@ -269,6 +278,26 @@ if command -v bluetoothctl &>/dev/null; then
     fi
 else
     warn "BlueZ not installed. Install with: sudo apt install bluez"
+fi
+
+# ── 5b. Controller input device check ───────────────────────────────────────
+
+info "Checking the controller's input device …"
+
+if grep -qi "xbox" /proc/bus/input/devices 2>/dev/null; then
+    success "Xbox controller found as an input device."
+    grep -i -A 3 "xbox" /proc/bus/input/devices | head -6 | sed 's/^/    /'
+else
+    warn "No Xbox controller input device found."
+    info "  The controller can be paired over Bluetooth and still have no"
+    info "  input device: when the kernel cannot read the controller's HID"
+    info "  descriptor no /dev/input node is created and no driver binds"
+    info "  (dmesg shows 'item fetching failed at offset ...')."
+    info ""
+    info "  Fix it by re-pairing the controller:"
+    info "    bash $INSTALL_DIR/repair_controller.sh${CONTROLLER_MAC:+ $CONTROLLER_MAC}"
+    info ""
+    info "  (it asks you to press the SYNC button once)"
 fi
 
 # ── 6. Permissions check ──────────────────────────────────────────────────────

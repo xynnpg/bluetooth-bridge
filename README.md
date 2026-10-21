@@ -380,6 +380,35 @@ sudo hciconfig  # show adapters
 - Move the Linux server closer to the controller
 - Some USB Bluetooth adapters have limited range — a dedicated BT 5.0 adapter helps
 
+### The controller is connected but does not appear on the PC
+
+`bluetoothctl` says `Connected: yes`, but the bridge sees no controller.
+The controller is paired, yet the **kernel could not read its HID report
+descriptor**, so no `/dev/input` node was created and no driver could
+bind. The kernel log shows it:
+
+```
+microsoft 0005:045E:0B20: item fetching failed at offset 40/44
+microsoft 0005:045E:0B20: probe with driver microsoft failed with error -22
+```
+
+Fix it by re-pairing the controller (the descriptor is then fetched from
+scratch):
+
+```bash
+bash ~/.bluetooth-bridge/repair_controller.sh
+```
+
+The script asks you to press the **SYNC button** on the controller once,
+then it removes the stale pairing, pairs, trusts and connects the
+controller and verifies that the input device appeared.
+
+If the descriptor is still incomplete afterwards, the controller's
+firmware or the Bluetooth firmware of the host is the cause: update
+`linux-firmware`, update the controller's firmware (needs a Windows PC),
+or use the controller over a **USB cable** — the standard xpad driver
+works there and the bridge sees it immediately.
+
 ### A button stays held after I let go of it
 
 The bridge releases a button as soon as the frame that says "not pressed"
