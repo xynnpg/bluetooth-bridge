@@ -77,6 +77,29 @@ class TCPStreamer:
         with self._lock:
             return self._sock is not None
 
+    def set_target(self, host: str, port: int) -> None:
+        """Point the streamer at another address.
+
+        Used when the Windows PC announces a different address than the
+        one in the .env (a new DHCP lease, for example).  The current
+        connection is dropped so the new target is used right away.
+        """
+        if host == self.host and port == self.port:
+            return
+        logger.info("Switching the target from %s:%s to %s:%s",
+                    self.host, self.port, host, port)
+        with self._lock:
+            self.host = host
+            self.port = port
+            sock = self._sock
+            self._sock = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+
     def stop(self) -> None:
         self._running = False
         with self._lock:

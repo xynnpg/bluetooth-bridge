@@ -75,16 +75,29 @@ class BridgeApp:
         # 1 — Bluetooth setup (pair / connect)
         self._setup_bluetooth()
 
-        # 2 — Find the evdev device
-        self._open_device()
-
-        # 3 — Start TCP streamer
+        # 2 — Start the TCP streamer BEFORE looking for the controller.
+        #     The connection to the PC must not depend on the controller
+        #     being present: without one (or with an unpaired one) the
+        #     device search blocks for a long time and the PC would show
+        #     "no controller" / "Linux bridge gone" even though the bridge
+        #     is running fine.  The streamer keeps the connection alive on
+        #     its own (keepalive PING), so the PC sees the bridge at once.
         self._tcp = TCPStreamer(
             pc_host, pc_port,
             on_disconnect=self._on_disconnect,
             on_recv_packet=self._on_recv_packet,
         )
         self._tcp.start()
+
+        # The configured address can go stale (the Windows PC got a new DHCP
+        # lease).  The Windows side broadcasts its address every few seconds
+        # — follow it when it differs from the configured one.
+        self._discovery_thread = threading.Thread(
+            target=self._discovery_watchdog, name="DiscoveryWatch", daemon=True)
+        self._discovery_thread.start()
+
+        # 3 — Find the evdev device
+        self._open_device()
 
         self._management = ManagementServer(
             self,
@@ -489,6 +502,35 @@ class BridgeApp:
                     "Still waiting for controller device (%d s elapsed)…",
                     attempt * 2,
                 )
+
+    def _discovery_watchdog(self) -> None:
+        """Follow the Windows PC when it announces a different address.
+
+        The broadcast is only used as a fallback: the configured address is
+        tried first, so a wrong .env does not stop the bridge from working.
+        """
+        deadline = time.monotonic() + 300
+        while self._running and time.monotonic() < deadline:
+            if self._tcp is not None and self._tcp.connected:
+                time.sleep(2.0)
+                continue
+            listener = DiscoveryListener(timeout=5.0)
+            listener.start()
+            while listener._running and self._running:
+                time.sleep(0.25)
+                result = listener.get()
+                if result is None:
+                    continue
+                found_ip, found_port = result
+                if self._tcp is not None and found_ip != self._tcp.host:
+                    logger.info("Windows PC announced %s:%d — switching from "
+                                "%s:%s", found_ip, found_port,
+                                self._tcp.host, self._tcp.port)
+                    self._tcp.set_target(found_ip, found_port)
+                else:
+                    logger.info("Windows PC confirmed %s:%d", found_ip, found_port)
+                return
+            time.sleep(1.0)
 
     def _on_disconnect(self) -> None:
         logger.warning("Connection to PC lost — will auto-reconnect")
