@@ -196,7 +196,14 @@ def main() -> int:
         linux_lines = read_local(args.linux_trace)
 
     if not windows_lines and not linux_lines:
-        print("! no trace files found — has the bridge been running?",
+        for label, path in (("windows", args.windows_trace),
+                            ("linux", args.linux_trace)):
+            if os.path.exists(path):
+                print(f"! the {label} trace file is empty: {path}",
+                      file=sys.stderr)
+            else:
+                print(f"! no {label} trace file: {path}", file=sys.stderr)
+        print("  Has the bridge been running? The trace is written while it runs.",
               file=sys.stderr)
         return 1
 
