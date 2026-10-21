@@ -373,43 +373,65 @@ try {
 Write-Step "Writing configuration …"
 
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-[System.IO.File]::WriteAllText("$INSTALL_DIR\config.ini", @"
+
+# The settings of the running installation are kept: a re-install must not
+# reset the web UI port, the Linux management token or anything else.
+$existing = @{}
+if (Test-Path "$INSTALL_DIR\config.ini") {
+    Get-Content "$INSTALL_DIR\config.ini" -Encoding UTF8 | ForEach-Object {
+        if ($_ -match '^\s*([^#;\[][^=]*?)\s*=\s*(.*?)\s*$') {
+            $existing[$Matches[1].Trim()] = $Matches[2].Trim()
+        }
+    }
+    Write-Info "Keeping the existing settings from config.ini"
+}
+
+function Get-Setting($key, $fallback) {
+    if ($existing.ContainsKey($key) -and $existing[$key] -ne "") {
+        return $existing[$key]
+    }
+    return $fallback
+}
+
+$cfg = @"
 [app]
-listen_port   = $LISTEN_PORT
-listen_host   = 0.0.0.0
-auto_discover = true
-auto_start    = true
-log_level     = INFO
+listen_port   = $(Get-Setting "listen_port"   $LISTEN_PORT)
+listen_host   = $(Get-Setting "listen_host"   "0.0.0.0")
+auto_discover = $(Get-Setting "auto_discover" "true")
+auto_start    = $(Get-Setting "auto_start"    "true")
+log_level     = $(Get-Setting "log_level"     "INFO")
 
 [webui]
-enabled         = true
-host            = 127.0.0.1
-port            = $WEBUI_PORT
-open_on_launch  = false
-auto_refresh_ms = 750
+enabled         = $(Get-Setting "enabled"         "true")
+host            = $(Get-Setting "host"            "127.0.0.1")
+port            = $(Get-Setting "port"            $WEBUI_PORT)
+open_on_launch  = $(Get-Setting "open_on_launch"  "false")
+auto_refresh_ms = $(Get-Setting "auto_refresh_ms" "750")
 
 [controller]
-rumble_enabled                = true
-low_battery_warn_pct          = 15
-deadzone_stick                = 15
-deadzone_trigger              = 1
-invert_left_y                 = false
-invert_right_y                = false
-battery_display_enabled       = true
-performance_warning_enabled   = true
-performance_warning_ms        = 180
+rumble_enabled                = $(Get-Setting "rumble_enabled"              "true")
+low_battery_warn_pct          = $(Get-Setting "low_battery_warn_pct"        "15")
+deadzone_stick                = $(Get-Setting "deadzone_stick"              "15")
+deadzone_trigger              = $(Get-Setting "deadzone_trigger"            "1")
+invert_left_y                 = $(Get-Setting "invert_left_y"               "false")
+invert_right_y                = $(Get-Setting "invert_right_y"              "false")
+battery_display_enabled       = $(Get-Setting "battery_display_enabled"    "true")
+performance_warning_enabled   = $(Get-Setting "performance_warning_enabled" "true")
+performance_warning_ms        = $(Get-Setting "performance_warning_ms"     "180")
 
 [tray]
-show_battery = true
+show_battery = $(Get-Setting "show_battery" "true")
 
 [network]
-discovery_port       = 9876
-keepalive_timeout_s  = 6.0
+discovery_port       = $(Get-Setting "discovery_port"      "9876")
+keepalive_timeout_s  = $(Get-Setting "keepalive_timeout_s" "6.0")
 
 [linux]
-management_port = 9988
-management_token =
-"@, $utf8NoBom)
+management_port = $(Get-Setting "management_port" "9988")
+management_token = $(Get-Setting "management_token" "")
+"@
+
+[System.IO.File]::WriteAllText("$INSTALL_DIR\config.ini", $cfg, $utf8NoBom)
 
 # Fallback VBS launcher if needed
 $vbsPath = "$INSTALL_DIR\launch.vbs"
