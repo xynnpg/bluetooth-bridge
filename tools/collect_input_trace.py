@@ -36,6 +36,7 @@ import configparser
 import json
 import os
 import re
+import socket
 import sys
 import urllib.error
 import urllib.request
@@ -82,7 +83,39 @@ def fetch_linux(host: str, port: int, token: str) -> list[str]:
     except (OSError, urllib.error.URLError, ValueError) as exc:
         print(f"! could not fetch the Linux trace from {url}: {exc}",
               file=sys.stderr)
+        print("  Is that the LINUX host? The Windows PC cannot reach its own",
+              file=sys.stderr)
+        print("  management API that way — pass the address of the machine",
+              file=sys.stderr)
+        print("  that runs the Docker container.", file=sys.stderr)
+        for addr in _local_addresses():
+            print(f"  this machine: {addr}", file=sys.stderr)
         return []
+
+
+def _local_addresses() -> list[str]:
+    """The IPv4 addresses of this machine (to spot a wrong --linux address)."""
+    found: list[str] = []
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            address = info[4][0]
+            if not address.startswith("127.") and address not in found:
+                found.append(address)
+    except OSError:
+        pass
+    # The address of the default route — the one the peer would use.
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.settimeout(0.5)
+        probe.connect(("8.8.8.8", 53))       # nothing is sent
+        address = probe.getsockname()[0]
+        probe.close()
+        if address and not address.startswith("127.") and address not in found:
+            found.append(address)
+    except OSError:
+        pass
+    return found
 
 
 def _config_value(section: str, option: str) -> str:
@@ -151,6 +184,9 @@ def analyse(lines: list[str]) -> list[str]:
             f"— this button is still held")
 
     # A release on the Linux side that never reached the Windows side.
+    # Only meaningful when the Windows side is part of the trace at all.
+    if not any(" WIN " in line for line in lines):
+        return problems
     linux_release: dict[str, str] = {}
     windows_release: dict[str, str] = {}
     for line in lines:
