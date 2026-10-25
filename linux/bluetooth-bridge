@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# Bluetooth Bridge — Linux helper command
+#
+# Installed next to docker-compose.yml. Safe to run at any time.
+set -euo pipefail
+
+VERSION="1.2.0"
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+    LINK_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$LINK_DIR/$SOURCE"
+done
+DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+ENV_FILE="$DIR/.env"
+COMPOSE_FILE="$DIR/docker-compose.yml"
+
+get_env() {
+    local key="$1"
+    [[ -f "$ENV_FILE" ]] || return 0
+    sed -n "s/^${key}=//p" "$ENV_FILE" | tail -1
+}
+
+TOKEN="$(get_env MANAGEMENT_TOKEN)"
+PORT="$(get_env MANAGEMENT_PORT)"
+PORT="${PORT:-9988}"
+
+if docker info >/dev/null 2>&1; then
+    DOCKER=(docker)
+elif sudo -n docker info >/dev/null 2>&1; then
+    DOCKER=(sudo docker)
+else
+    echo "Cannot reach Docker. Start Docker or join the docker group." >&2
+    exit 1
+fi
+COMPOSE=("${DOCKER[@]}" compose -f "$COMPOSE_FILE")
+
+api() {
+    local method="$1" path="$2"
+    local args=(-fsS --max-time 6)
+    [[ -n "$TOKEN" ]] && args+=(-H "X-Bridge-Token: $TOKEN")
+    if [[ "$method" == "POST" ]]; then
+        args+=(-X POST -H "Content-Type: application/json" -d "${3:-{}}")
+    fi
+    curl "${args[@]}" "http://127.0.0.1:${PORT}${path}"
+}
+
+usage() {
+    cat <<'EOF'
+bluetooth-bridge — Linux side helper
+
+Usage:
+  bluetooth-bridge [command]
+
+Commands:
+  status          Container, controller and rumble backend at a glance (default)
+  doctor          Run the common connection/rumble checks
+  logs            Follow the container log
+  restart         Restart the container
+  test-rumble     Pulse both motors for one second
+  dashboard       Explain how to open the Windows dashboard
+  update          Update from GitHub, keeping existing settings
+  uninstall       Stop and remove this install (asks first)
+  version         Print the helper version
+  help            Show this help
+EOF
+}
+
+status() {
+    echo "Bluetooth Bridge $VERSION"
+    local container
+    container="$("${DOCKER[@]}" ps --filter "name=xbox-bridge" \
+        --format '{{.State}} ({{.Status}})' 2>/dev/null | head -1 || true)"
+    echo "  container: ${container:-not running}"
+
+    local raw
+    if ! raw="$(api GET /api/status 2>/dev/null)"; then
+        echo "  management API: not reachable on 127.0.0.1:$PORT"
+        echo "  hint: bluetooth-bridge doctor"
+        return 1
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s' "$raw" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+r = d.get("rumble") or {}
+print("  controller:", d.get("controller_path") or "not detected")
+print("  tcp:", "connected" if d.get("tcp_connected") else "not connected")
+backend = r.get("backend") or "none"
+line = "  rumble: " + backend
+if r.get("path"):
+    line += " on " + r["path"]
+print(line)
+if r.get("error"):
+    print("  rumble error:", r["error"])
+'
+    else
+        echo "  $raw"
+    fi
+}
+
+doctor() {
+    local failed=0
+    echo "Bluetooth Bridge doctor"
+    echo ""
+
+    if "${DOCKER[@]}" info >/dev/null 2>&1; then
+        echo "  [ok] Docker daemon"
+    else
+        echo "  [!!] Docker daemon is not reachable"; failed=$((failed + 1))
+    fi
+
+    local state
+    state="$("${DOCKER[@]}" inspect -f '{{.State.Status}}' xbox-bridge 2>/dev/null || true)"
+    if [[ "$state" == "running" ]]; then
+        echo "  [ok] Container is running"
+    else
+        echo "  [!!] Container state: ${state:-not found}"; failed=$((failed + 1))
+    fi
+
+    if compgen -G "/dev/input/event*" >/dev/null; then
+        echo "  [ok] Input event nodes are visible"
+    else
+        echo "  [!!] No /dev/input/event* nodes found"; failed=$((failed + 1))
+    fi
+
+    local raw
+    if raw="$(api GET /api/status 2>/dev/null)"; then
+        echo "  [ok] Management API responds"
+        if command -v python3 >/dev/null 2>&1; then
+            local info cpath backend rerror
+            info="$(printf '%s' "$raw" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+r = d.get("rumble") or {}
+print(d.get("controller_path") or "-", r.get("backend") or "none", r.get("error") or "-", sep="|")
+')"
+            IFS='|' read -r cpath backend rerror <<< "$info"
+            [[ "$cpath" == "-" ]] && cpath=""
+            [[ "$rerror" == "-" ]] && rerror=""
+            if [[ -n "$cpath" ]]; then
+                echo "  [ok] Controller: $cpath"
+            else
+                echo "  [!!] Controller not detected"; failed=$((failed + 1))
+            fi
+            if [[ -n "$backend" && "$backend" != "none" ]]; then
+                echo "  [ok] Rumble backend: $backend"
+            else
+                echo "  [!!] Rumble backend: none${rerror:+ ($rerror)}"; failed=$((failed + 1))
+            fi
+        else
+            echo "  $raw"
+        fi
+    else
+        echo "  [!!] Management API is not reachable on 127.0.0.1:$PORT"
+        failed=$((failed + 1))
+    fi
+
+    local errors
+    errors="$("${DOCKER[@]}" logs --tail 120 xbox-bridge 2>&1 \
+        | grep -E "No rumble backend|Could not write EV_FF|No controller|ERROR|Traceback" \
+        | tail -6 || true)"
+    if [[ -n "$errors" ]]; then
+        echo ""
+        echo "  Recent problems:"
+        printf '%s\n' "$errors" | sed 's/^/    /'
+    fi
+
+    echo ""
+    if (( failed == 0 )); then
+        echo "  Result: no obvious problems."
+        echo "  If rumble is silent, run: bluetooth-bridge test-rumble"
+    else
+        echo "  Result: $failed check(s) need attention."
+        echo "  Logs: bluetooth-bridge logs"
+    fi
+    return 0
+}
+
+test_rumble() {
+    echo "Sending a one-second, full-strength pulse to both motors …"
+    local raw
+    if ! raw="$(api POST /api/rumble/test '{"left":255,"right":255,"duration":1.0}')"; then
+        echo "The Linux management API did not accept the test." >&2
+        echo "Run 'bluetooth-bridge doctor' for details." >&2
+        return 1
+    fi
+    echo "$raw"
+    echo "You should feel both motors for one second."
+}
+
+uninstall_bridge() {
+    echo "This removes the container, its config, logs and auto-start unit."
+    echo "The Docker image, Python and ViGEmBus are left alone."
+    local answer=""
+    read -r -p "Type 'yes' to continue: " answer || true
+    [[ "$answer" == "yes" ]] || { echo "Cancelled."; return 0; }
+
+    "${COMPOSE[@]}" down --remove-orphans || true
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if [[ $EUID -eq 0 ]]; then
+            systemctl disable --now xbox-bridge 2>/dev/null || true
+            rm -f /etc/systemd/system/xbox-bridge.service
+            systemctl daemon-reload 2>/dev/null || true
+        else
+            systemctl --user disable --now xbox-bridge 2>/dev/null || true
+            rm -f "$HOME/.config/systemd/user/xbox-bridge.service"
+            systemctl --user daemon-reload 2>/dev/null || true
+        fi
+    fi
+
+    rm -f "$HOME/.local/bin/bluetooth-bridge"
+    cd "$HOME"
+    rm -rf "$DIR"
+    echo "Removed $DIR."
+}
+
+case "${1:-status}" in
+    status)        status ;;
+    doctor)        doctor ;;
+    logs)          exec "${DOCKER[@]}" logs -f --tail 100 xbox-bridge ;;
+    restart)       "${COMPOSE[@]}" restart ;;
+    test-rumble)   test_rumble ;;
+    dashboard)
+        echo "Open the dashboard on the Windows PC:"
+        echo "  tray icon → Open Web UI"
+        echo "It binds to 127.0.0.1 on Windows, so it is intentionally not exposed to the LAN."
+        ;;
+    update)
+        echo "Updating from GitHub. Existing settings are kept."
+        echo ""
+        curl -fsSL "https://raw.githubusercontent.com/xynnpg/bluetooth-bridge/main/linux/install.sh" \
+            | bash -s -- --update
+        ;;
+    uninstall)     uninstall_bridge ;;
+    version)       echo "$VERSION" ;;
+    help|-h|--help) usage ;;
+    *)             echo "Unknown command: $1" >&2; usage; exit 2 ;;
+esac

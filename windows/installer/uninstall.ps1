@@ -1,79 +1,111 @@
-#Requires -RunAsAdministrator
-<#
+﻿<#
 .SYNOPSIS
-    Bluetooth Bridge — Uninstaller
+    Remove the Bluetooth Bridge Windows app.
 
 .DESCRIPTION
-    Removes the Windows Bluetooth Bridge installation including:
-    - Application files and venv
-    - Startup + Start Menu shortcuts
-    - Log files
+    Stops the app, removes its firewall rules, shortcuts and install folder.
+    ViGEmBus and Python are shared system components and are intentionally
+    left installed.
 
-    Run from an elevated PowerShell OR the Start Menu shortcut:
-        powershell -ExecutionPolicy Bypass -File "%USERPROFILE%\bluetooth_bridge\uninstall.ps1"
+    Run from the Start Menu shortcut "Uninstall Bluetooth Bridge", or:
+        powershell -NoProfile -ExecutionPolicy Bypass -File uninstall.ps1
 #>
 
-$ErrorActionPreference = "Stop"
-
-$INSTALL_DIR  = "$env:USERPROFILE\bluetooth_bridge"
-$STARTUP_DIR  = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs"
-$LOG_DIR      = "$env:LOCALAPPDATA\bluetooth_bridge"
-
-Write-Host "[*] Bluetooth Bridge — Uninstalling …" -ForegroundColor Cyan
-
-# Stop the running app if it is running
-$running = Get-Process | Where-Object {
-    $_.Path -like "*bluetooth_bridge*"
-} -ErrorAction SilentlyContinue
-
-if ($running) {
-    Write-Host "[*] Stopping running instance …" -ForegroundColor Cyan
-    $running | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep 2
-}
-
-# Remove shortcuts
-$shortcuts = @(
-    "$STARTUP_DIR\Bluetooth Bridge.lnk",
-    "$INSTALL_DIR\Bluetooth Bridge.lnk"
+param(
+    [switch]$Force
 )
 
-foreach ($lnk in $shortcuts) {
-    if (Test-Path $lnk) {
-        Remove-Item $lnk -Force
-        Write-Host "[✓] Removed shortcut: $lnk" -ForegroundColor Green
+$ErrorActionPreference = "Stop"
+$INSTALL_DIR = $PSScriptRoot
+$LOG_DIR     = "$env:LOCALAPPDATA\bluetooth_bridge"
+$START_MENU  = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs"
+$STARTUP     = "$START_MENU\Startup"
+
+Write-Host ""
+Write-Host "  Bluetooth Bridge — uninstall" -ForegroundColor Cyan
+Write-Host "  This removes the app, logs, config and shortcuts from this PC." -ForegroundColor Gray
+Write-Host "  ViGEmBus and Python are left installed." -ForegroundColor Gray
+Write-Host ""
+
+if (-not $Force) {
+    $answer = Read-Host "Type 'yes' to remove $INSTALL_DIR"
+    if ($answer -ne "yes") {
+        Write-Host "Cancelled." -ForegroundColor Yellow
+        exit 0
     }
 }
 
-# Remove app directory
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin) {
+    Write-Host "[*] Requesting administrator rights for the firewall cleanup …"
+    try {
+        Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -Verb RunAs `
+            -ArgumentList @(
+                "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", "`"$PSCommandPath`"", "-Force"
+            )
+        exit 0
+    } catch {
+        Write-Host "[!] Continuing without administrator rights." -ForegroundColor Yellow
+        Write-Host "    Firewall rules will be left in place." -ForegroundColor Yellow
+    }
+}
+
+Write-Host "[*] Stopping the running app …"
+Get-Process -Name "BluetoothBridge" -ErrorAction SilentlyContinue |
+    Stop-Process -Force -ErrorAction SilentlyContinue
+
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.CommandLine -and
+        $_.CommandLine -like "*$INSTALL_DIR*src.main*"
+    } |
+    ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+
+if ($isAdmin) {
+    Write-Host "[*] Removing firewall rules …"
+    Remove-NetFirewallRule -DisplayName "Xbox Bluetooth Bridge" -ErrorAction SilentlyContinue
+    Remove-NetFirewallRule -DisplayName "Xbox Bluetooth Bridge Discovery" -ErrorAction SilentlyContinue
+}
+
+Write-Host "[*] Removing shortcuts …"
+$shortcuts = @(
+    "$START_MENU\Bluetooth Bridge.lnk",
+    "$START_MENU\Bluetooth Bridge Dashboard.url",
+    "$START_MENU\Uninstall Bluetooth Bridge.lnk",
+    "$STARTUP\Bluetooth Bridge.lnk"
+)
+foreach ($path in $shortcuts) {
+    Remove-Item $path -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "[*] Removing logs …"
+if (Test-Path $LOG_DIR) {
+    Remove-Item $LOG_DIR -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "[*] Removing files …"
+Set-Location $env:TEMP
+Remove-Item $INSTALL_DIR -Recurse -Force -ErrorAction SilentlyContinue
+
 if (Test-Path $INSTALL_DIR) {
-    Write-Host "[*] Removing application directory …" -ForegroundColor Cyan
-    # First try normal delete
+    Write-Host "[!] Some files are still in use. Retrying with elevated file ownership …" -ForegroundColor Yellow
+    & takeown /F $INSTALL_DIR /R /D Y 2>$null | Out-Null
+    & icacls $INSTALL_DIR /T /grant Administrators:F 2>$null | Out-Null
     Remove-Item $INSTALL_DIR -Recurse -Force -ErrorAction SilentlyContinue
-    if (Test-Path $INSTALL_DIR) {
-        # Retry with takeown on locked files
-        & takeown /F $INSTALL_DIR /R /D Y 2>$null | Out-Null
-        & icacls $INSTALL_DIR /T /grant Administrators:F 2>$null | Out-Null
-        Remove-Item $INSTALL_DIR -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    if (Test-Path $INSTALL_DIR) {
-        Write-Host "[!] Could not remove $INSTALL_DIR — remove it manually." -ForegroundColor Yellow
-    } else {
-        Write-Host "[✓] Application directory removed." -ForegroundColor Green
-    }
 }
 
-# Suggest removing log directory too (keep user's logs by default — logs are small)
-$removeLogs = Read-Host "Remove log files too? [y/N]"
-if ($removeLogs -eq "y" -or $removeLogs -eq "Y") {
-    if (Test-Path $LOG_DIR) {
-        Remove-Item $LOG_DIR -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Host "[✓] Log directory removed." -ForegroundColor Green
-    }
+if (Test-Path $INSTALL_DIR) {
+    Write-Host "[!] Could not remove every file: $INSTALL_DIR" -ForegroundColor Yellow
+    Write-Host "    Close the app, then remove that folder manually." -ForegroundColor Yellow
+} else {
+    Write-Host ""
+    Write-Host "  Bluetooth Bridge removed." -ForegroundColor Green
+    Write-Host "  You can reinstall at any time with the same one-line installer." -ForegroundColor Gray
+    Write-Host ""
 }
-
-Write-Host ""
-Write-Host "[✓] Uninstall complete." -ForegroundColor Green
-Write-Host "    ViGEmBus driver was left installed (it is a shared system component)."
-Write-Host "    To remove it, use Programs & Features in Control Panel."
-Write-Host ""

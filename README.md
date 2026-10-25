@@ -68,13 +68,22 @@ irm https://raw.githubusercontent.com/xynnpg/bluetooth-bridge/main/windows/insta
 > Replace `user` with your GitHub username before running.
 
 The installer will:
-- Check for Python 3.8+ and install it if missing
+- Check for 64-bit Python 3.9+ and install it if missing
 - Download and install ViGEmBus automatically
 - Install the app to `%USERPROFILE%\bluetooth_bridge`
 - Register itself in **Start Menu → Startup**
 - Show your local IP address and the Linux install command
 
 You should see a **green** tray icon appear. You're ready for Linux.
+
+The Windows installer is safe to re-run: `config.ini`, the dashboard port and
+the management token are kept. It also adds a **Bluetooth Bridge Dashboard**
+shortcut and an **Uninstall Bluetooth Bridge** entry to the Start Menu.
+
+When running the saved `install.ps1` directly, these flags are available:
+`-Help`, `-NoLaunch`, `-NoBrowser`, `-NoStartup`, `-SkipBuild`, and
+`-LocalIp <address>`. For `irm | iex`, use the matching environment variables
+such as `BB_NO_LAUNCH=1`, `BB_SKIP_BUILD=1`, or `BB_LOCAL_IP=192.168.1.50`.
 
 ---
 
@@ -135,6 +144,36 @@ tray's *Open Web UI* item, and the **About** tab, show the real URL.
 ```bash
 docker logs -f xbox-bridge
 ```
+
+### Everyday commands (Linux)
+
+The installer creates a `bluetooth-bridge` helper in `~/.local/bin`:
+
+```bash
+bluetooth-bridge status       # container, controller and rumble backend
+bluetooth-bridge doctor       # diagnose missing controller or silent rumble
+bluetooth-bridge logs         # follow the container log
+bluetooth-bridge restart      # restart the container
+bluetooth-bridge test-rumble  # pulse both motors for one second
+bluetooth-bridge update       # update from GitHub (keeps settings)
+bluetooth-bridge uninstall    # remove the install (asks first)
+```
+
+`doctor` is the first thing to run when something is wrong: it checks Docker,
+the controller node, the management API and the attached rumble backend.
+
+### Updating safely
+
+A plain re-install keeps the existing `.env` and controller settings:
+
+```bash
+bash linux/install.sh --update
+```
+
+Use `--reconfigure` to change the Windows address or controller. For
+unattended installs, `--yes --windows-ip <IP>` skips every prompt; add
+`--dry-run` to check prerequisites and print the chosen settings without
+changing anything.
 
 The Windows dashboard's **Linux container** tab uses port `9988` to show the
 Linux process status and logs, update the Linux `.env`, and request a
@@ -415,7 +454,9 @@ sudo hciconfig  # show adapters
    the Linux side attached (`Force feedback`, `Hidraw`, or `None`).
 2. Open **Linux container**. The Container status card shows the backend,
    device and state, plus a **Test on Linux** button. That button pulses the
-   controller directly, bypassing Windows, TCP and the game.
+   controller directly, bypassing Windows, TCP and the game. On the Linux
+   host, `bluetooth-bridge doctor` and `bluetooth-bridge test-rumble` do the
+   same checks.
 3. Press **Test motors** on the dashboard to test the full path. A pulse means
    Windows → TCP → Linux → controller is working; silence means the problem
    is before the controller. If a game leaves the motors running, press

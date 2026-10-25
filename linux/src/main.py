@@ -99,9 +99,10 @@ class BridgeApp:
             target=self._discovery_watchdog, name="DiscoveryWatch", daemon=True)
         self._discovery_thread.start()
 
-        # 3 — Find the evdev device
-        self._open_device()
-
+        # 3 — Management, battery and rumble services start BEFORE the
+        #     controller search.  The search can wait up to 60 seconds (or
+        #     loop forever after a disconnect); the dashboard must still be
+        #     able to say "waiting for controller" during that time.
         self._management = ManagementServer(
             self,
             host=os.getenv("MANAGEMENT_HOST", "0.0.0.0"),
@@ -132,7 +133,10 @@ class BridgeApp:
         )
         self._rumble_thread.start()
 
-        # 4 — Main poll loop
+        # 4 — Find the evdev device
+        self._open_device()
+
+        # 5 — Main poll loop
         logger.info("Bridge running — press Ctrl+C to stop")
         while self._running:
             self._poll()
