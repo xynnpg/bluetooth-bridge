@@ -25,7 +25,7 @@ except ImportError:
 
 logger = logging.getLogger("tray")
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 _COLOR_ONLINE  = (40, 210, 90)
 _COLOR_WARN    = (230, 165, 0)

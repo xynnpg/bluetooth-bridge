@@ -22,10 +22,12 @@ RuntimeDirectory=xbox-bridge
 
 # Grant docker access to dbus / bluetooth sockets at runtime
 # The container is --privileged and --network host; if you prefer no --privileged,
-# add these binds at the *host* level:
+# add these binds at the *host* level.  Input devices must stay writable:
+# force-feedback rumble is played by writing EV_FF events to the event node.
 # BindReadOnlyPaths=/var/run/dbus:/var/run/dbus:ro
 # BindReadOnlyPaths=/run/dbus:/run/dbus:ro
-# BindReadOnlyPaths=/dev/input:/dev/input:ro
+# BindPaths=/dev/input:/dev/input
+# BindPaths=/dev/hidraw:/dev/hidraw
 
 # Environment (override in /etc/default/xbox-bridge or .env next to docker-compose.yml)
 EnvironmentFile=-/home/xynnpg/Projects/bluetooth-bridge/linux/.env

@@ -31,8 +31,7 @@ from .discovery import DiscoveryListener
 from .network import TCPStreamer
 from .management import ManagementServer
 from .rumble import (
-    RumbleWriter, find_hidraw_by_mac, find_hidraw_for,
-    is_force_feedback_available,
+    RumbleWriter, find_force_feedback_for, find_hidraw_by_mac, find_hidraw_for,
 )
 
 logger = logging.getLogger("main")
@@ -50,6 +49,10 @@ class BridgeApp:
         self._rumble = RumbleWriter()
         self._rumble_lock = threading.Lock()
         self._last_rumble = (0, 0)
+        # While a self-test runs, ignore game rumble so the pulse is not
+        # overwritten by the 20 Hz apply loop.
+        self._rumble_test_until = 0.0
+        self._rumble_test_token = 0
         # Input-diagnostic logging state (used by _maybe_log_input)
         self._last_input_log = 0.0
         self._last_input_sig: tuple | None = None
@@ -187,44 +190,53 @@ class BridgeApp:
     def _open_rumble(self) -> None:
         """Locate and open the rumble backend for the current evdev device.
 
-        Order of preference:
+        Backend order depends on the transport:
 
-        1. **hidraw sibling** — works for USB controllers and most BT
-           controllers on kernels that create a hidraw node per input
-           device.  We can write the controller-specific output report
-           directly.
-        2. **MAC-keyed hidraw fallback** — when the device tree link is
-           missing, search all hidraw nodes by MAC.
-        3. **Linux Force-Feedback** — Bluetooth-only Xbox Wireless
-           controllers do not create a hidraw sibling; the kernel
-           exposes ``FF_RUMBLE`` on the input device instead.  Use the
-           generic FF API.
-        4. **No rumble** — log a warning and let the rest of the bridge
-           continue.
+        * **Bluetooth** — try the kernel Force-Feedback interface first.
+          A Bluetooth controller often has a ``/dev/hidrawN`` node too,
+          but writing raw output reports to it does not reliably reach
+          the motors.  The ``FF_RUMBLE`` path works with both
+          ``hid-microsoft`` and ``xpadneo``.
+        * **USB** — try hidraw first (direct output reports), then fall
+          back to Force Feedback.
+
+        The FF device is searched across the controller's event nodes,
+        because the force-feedback capability is not always attached to
+        the same node used for reading input.
         """
+        ff_path = find_force_feedback_for(self._device)
+
         hidraw = find_hidraw_for(self._device.path)
         if not hidraw and self._controller_mac:
             hidraw = find_hidraw_by_mac(self._controller_mac)
 
-        with self._rumble_lock:
-            if hidraw:
-                if self._rumble.set_device(hidraw):
-                    return
-                # hidraw was found but could not be opened — fall
-                # through to try the FF path on the input device.
-                logger.warning("hidraw %s present but unusable; "
-                               "falling back to FF rumble", hidraw)
+        bustype = getattr(getattr(self._device, "info", None), "bustype", 0)
+        phys = (getattr(self._device, "phys", "") or "").lower()
+        is_bluetooth = bustype == 0x0005 or "bluetooth" in phys
 
-            if is_force_feedback_available(self._device.path):
-                if self._rumble.set_device(self._device.path):
+        order = (
+            [("force feedback", ff_path), ("hidraw", hidraw)]
+            if is_bluetooth else
+            [("hidraw", hidraw), ("force feedback", ff_path)]
+        )
+
+        with self._rumble_lock:
+            tried: set[str] = set()
+            for label, path in order:
+                if not path or path in tried:
+                    continue
+                tried.add(path)
+                if self._rumble.set_device(path):
+                    logger.info("Rumble backend: %s on %s", label, path)
                     return
-                logger.warning("FF rumble present on %s but unusable",
-                               self._device.path)
+                logger.warning("%s rumble at %s is unusable; "
+                               "trying the next backend", label, path)
 
             logger.warning(
                 "No rumble backend available for %s — vibration disabled. "
-                "If the controller is USB-attached, ensure the container "
-                "can see /dev/hidraw* in RW mode.",
+                "For USB controllers ensure /dev/hidraw* is writable; for "
+                "Bluetooth controllers ensure /dev/input is writable "
+                "(both need rw in the container).",
                 self._device.path,
             )
 
@@ -329,6 +341,8 @@ class BridgeApp:
             logger.debug("Could not send the released state: %s", exc)
 
     def _maybe_rumble(self, state) -> None:
+        if time.monotonic() < self._rumble_test_until:
+            return
         with self._state_lock:
             rl, rr = state.rumble_left, state.rumble_right
         if (rl, rr) == self._last_rumble:
@@ -336,6 +350,45 @@ class BridgeApp:
         self._last_rumble = (rl, rr)
         with self._rumble_lock:
             self._rumble.apply(rl, rr)
+
+    def test_rumble(self, left: int = 255, right: int = 255,
+                    duration: float = 1.0) -> dict:
+        """Pulse the Linux-side rumble backend directly.
+
+        This is a diagnostic that bypasses Windows, TCP and the game.  It
+        proves whether the controller and kernel backend can actually
+        vibrate, independently of the rest of the bridge.
+        """
+        if not self._rumble.available:
+            self._open_rumble()
+        if not self._rumble.available:
+            raise RuntimeError(
+                "No rumble backend is attached. Check the Linux log for "
+                "the FF/hidraw attach warning."
+            )
+
+        self._rumble_test_until = time.monotonic() + duration + 0.25
+        self._rumble_test_token += 1
+        token = self._rumble_test_token
+        with self._rumble_lock:
+            # Clear first so a repeated test is never deduplicated.
+            self._rumble.apply(0, 0)
+            self._rumble.apply(left, right)
+
+        logger.info("Rumble self-test: left=%d right=%d for %.1fs",
+                    left, right, duration)
+
+        def stop() -> None:
+            time.sleep(duration)
+            if token != self._rumble_test_token:
+                return
+            with self._rumble_lock:
+                self._rumble.apply(0, 0)
+            if token == self._rumble_test_token:
+                self._rumble_test_until = 0.0
+
+        threading.Thread(target=stop, name="RumbleSelfTest", daemon=True).start()
+        return self._rumble.describe()
 
     def _maybe_log_input(self, state) -> None:
         """Log trigger / stick / button changes at INFO for live diagnosis.
@@ -375,6 +428,9 @@ class BridgeApp:
         """
         while self._running:
             try:
+                if time.monotonic() < self._rumble_test_until:
+                    time.sleep(0.05)
+                    continue
                 if self._state is not None:
                     with self._state_lock:
                         rl, rr = self._state.rumble_left, self._state.rumble_right
@@ -397,11 +453,26 @@ class BridgeApp:
         """
         if len(packet) < 18:
             return
+        # The Windows dashboard's "Test motors" action marks its packet so
+        # the Linux side can run the direct backend test instead of just
+        # feeding one more value into the game-rumble stream.  That keeps
+        # the pulse from being overwritten by a game's rumble updates.
+        if len(packet) >= 48 and packet[40:48] == b"RUMBTEST":
+            left, right = packet[16], packet[17]
+            try:
+                self.test_rumble(left, right, duration=0.8)
+            except Exception as exc:
+                logger.warning("Rumble test packet failed: %s", exc)
+            return
         with self._state_lock:
             if self._state is None:
                 return
+            old = (self._state.rumble_left, self._state.rumble_right)
             self._state.rumble_left  = packet[16]
             self._state.rumble_right = packet[17]
+            new = (self._state.rumble_left, self._state.rumble_right)
+        if new != old:
+            logger.info("Rumble from PC: left=%d right=%d", new[0], new[1])
 
     def _battery_poll_loop(self) -> None:
         """Background poller for `bluetoothctl info` battery readings.

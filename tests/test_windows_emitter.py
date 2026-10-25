@@ -264,3 +264,87 @@ def test_watchdog_releases_buttons_when_only_pings_arrive(
 
     assert released, \
         "the button is still held although only PING keepalives arrive"
+
+
+class _RumbleReceiver:
+    def __init__(self):
+        self.packets: list[bytes] = []
+
+    def send_state(self, packet: bytes) -> bool:
+        self.packets.append(packet)
+        return True
+
+
+def test_test_rumble_sends_a_pulse_then_stops(windows_main, tmp_path):
+    """The dashboard's Test motors action must drive the real path."""
+    app = _windows_app(windows_main, tmp_path)
+    receiver = _RumbleReceiver()
+    app._receiver = receiver
+    app._pc_reachable = True
+
+    assert app._test_rumble() is True
+    assert wait_until(lambda: len(receiver.packets) >= 2, timeout=2.0), \
+        "the rumble test did not send both the pulse and the stop"
+
+    pulse, stop = receiver.packets[0], receiver.packets[-1]
+    assert (pulse[16], pulse[17]) == (255, 255)
+    assert pulse[40:48] == b"RUMBTEST", \
+        "the test pulse must be marked so Linux can run its direct self-test"
+    assert (stop[16], stop[17]) == (0, 0)
+    assert (app._state.rumble_left, app._state.rumble_right) == (0, 0)
+
+
+def test_test_rumble_respects_the_vibration_toggle(windows_main, tmp_path):
+    config_file = tmp_path / "config.ini"
+    config_file.write_text("[controller]\nrumble_enabled = false\n",
+                           encoding="utf-8")
+    app = windows_main.BridgeApp(windows_main.Config(str(config_file)))
+    app._receiver = _RumbleReceiver()
+    app._pc_reachable = True
+
+    with pytest.raises(RuntimeError, match="turned off"):
+        app._test_rumble()
+    assert app._receiver.packets == []
+
+
+def test_turning_vibration_off_stops_running_motors(windows_main, tmp_path):
+    """The dashboard switch must stop a motor that is already rumbling.
+
+    The monitor loop periodically re-sends the last rumble values.  Clearing
+    the emitter's flag alone left the bridge's own ``_last_rumble`` intact,
+    so the next resend started the motors again.
+    """
+    config_file = tmp_path / "config.ini"
+    config_file.write_text("[controller]\nrumble_enabled = false\n",
+                           encoding="utf-8")
+    app = windows_main.BridgeApp(windows_main.Config(str(config_file)))
+    receiver = _RumbleReceiver()
+    app._receiver = receiver
+    app._pc_reachable = True
+    app._last_rumble = (180, 90)
+    app._state.on_rumble(180, 90)
+
+    app._on_settings_applied({"controller.rumble_enabled": False})
+
+    assert app._emitter._rumble_enabled is False
+    assert app._last_rumble == (0, 0)
+    assert (app._state.rumble_left, app._state.rumble_right) == (0, 0)
+    assert receiver.packets, "no stop packet was sent"
+    stop = receiver.packets[-1]
+    assert (stop[16], stop[17]) == (0, 0)
+
+
+def test_stop_rumble_action_sends_zero_and_clears_state(windows_main, tmp_path):
+    app = _windows_app(windows_main, tmp_path)
+    receiver = _RumbleReceiver()
+    app._receiver = receiver
+    app._pc_reachable = True
+    app._last_rumble = (200, 120)
+    app._state.on_rumble(200, 120)
+
+    assert app._stop_rumble() is True
+
+    assert app._last_rumble == (0, 0)
+    assert (app._state.rumble_left, app._state.rumble_right) == (0, 0)
+    assert receiver.packets
+    assert (receiver.packets[-1][16], receiver.packets[-1][17]) == (0, 0)

@@ -51,7 +51,6 @@ INSTALL_DIR = os.path.abspath(os.getcwd())
 CONFIG_FILE = os.path.join(INSTALL_DIR, "config.ini")
 
 _RUMBLE_PACK_FMT = "<HHHHBBBBBBBBBB"
-_RUMBLE_PACK_SIZE = struct.calcsize(_RUMBLE_PACK_FMT)
 
 PROTO_VERSION = 0x02
 PAYLOAD_SIZE  = 54
@@ -96,9 +95,9 @@ def _configure_logging(state: BridgeState, level_name: str) -> None:
     root.addHandler(eb)
 
 
-def _build_rumble_packet(left: int, right: int) -> bytes:
+def _build_rumble_packet(left: int, right: int, *, test: bool = False) -> bytes:
     flags = 0
-    pkt = struct.pack(
+    pkt = bytearray(struct.pack(
         _RUMBLE_PACK_FMT,
         32768, 32768, 32768, 32768,
         0, 0,
@@ -109,8 +108,13 @@ def _build_rumble_packet(left: int, right: int) -> bytes:
         flags,
         max(0, min(255, int(left))),
         max(0, min(255, int(right))),
-    )
-    return pkt + b"\x00" * (PAYLOAD_SIZE - _RUMBLE_PACK_SIZE)
+    ))
+    pkt.extend(b"\x00" * (PAYLOAD_SIZE - len(pkt)))
+    if test:
+        # Reserved area bytes 40..47.  The Linux receiver turns this into a
+        # direct Linux-side self-test so game rumble cannot overwrite it.
+        pkt[40:48] = b"RUMBTEST"
+    return bytes(pkt)
 
 
 class BridgeApp:
@@ -191,6 +195,8 @@ class BridgeApp:
                 "open_logs":        self._open_folder,
                 "quit":             self._request_quit,
                 "settings_applied": self._on_settings_applied,
+                "test_rumble":      self._test_rumble,
+                "stop_rumble":      self._stop_rumble,
             },
         )
         self._webui.start()
@@ -278,6 +284,7 @@ class BridgeApp:
             return
         if not self._pc_reachable:
             return
+        logger.info("Rumble from game/host: left=%d right=%d", left, right)
         self._last_rumble = (left, right)
         pkt = _build_rumble_packet(left, right)
         if not self._receiver.send_state(pkt):
@@ -296,6 +303,50 @@ class BridgeApp:
         left, right = self._last_rumble
         self._receiver.send_state(_build_rumble_packet(left, right))
 
+    def _test_rumble(self) -> bool:
+        """Send a short pulse to both motors.
+
+        This is the dashboard's "Test motors" action.  It exercises the
+        whole feedback path (Windows → TCP → Linux → FF/hidraw) without
+        needing a game, which makes a silent controller much easier to
+        diagnose.
+        """
+        if not self._config.get_bool("controller.rumble_enabled"):
+            raise RuntimeError("Vibration is turned off in the dashboard.")
+        if self._receiver is None or not self._pc_reachable:
+            raise RuntimeError("No Linux bridge is connected.")
+
+        def send_test(left: int, right: int) -> None:
+            """Send a marked rumble packet; Linux runs its direct self-test."""
+            self._state.on_rumble(left, right)
+            if self._receiver is not None and self._pc_reachable:
+                self._receiver.send_state(
+                    _build_rumble_packet(left, right, test=True))
+
+        def pulse() -> None:
+            try:
+                send_test(255, 255)
+                logger.info("Rumble self-test packet: left=255 right=255")
+                time.sleep(1.0)
+            finally:
+                self._state.on_rumble(0, 0)
+                self._last_rumble = (0, 0)
+                if self._receiver is not None and self._pc_reachable:
+                    self._receiver.send_state(_build_rumble_packet(0, 0))
+
+        self._last_rumble = (0, 0)
+        threading.Thread(target=pulse, name="RumbleTest", daemon=True).start()
+        return True
+
+    def _stop_rumble(self) -> bool:
+        """Immediately stop both motors and clear the periodic resend."""
+        self._last_rumble = (0, 0)
+        self._state.on_rumble(0, 0)
+        if self._receiver is not None and self._pc_reachable:
+            self._receiver.send_state(_build_rumble_packet(0, 0))
+        logger.info("Rumble stop requested from the dashboard")
+        return True
+
     def _on_settings_applied(self, changed: dict) -> None:
         """React to a save from the web dashboard without a restart."""
         if not changed:
@@ -305,8 +356,17 @@ class BridgeApp:
             logging.getLogger().setLevel(getattr(logging, level, logging.INFO))
             logger.info("Log level changed to %s", level)
         if "controller.rumble_enabled" in changed:
-            self._emitter.set_rumble_enabled(
-                self._config.get_bool("controller.rumble_enabled"))
+            enabled = self._config.get_bool("controller.rumble_enabled")
+            self._emitter.set_rumble_enabled(enabled)
+            if not enabled:
+                # Kill any rumble that is already running and make sure the
+                # periodic resend does not put it back.  Without this, a
+                # motor that was rumbling when the switch was turned off
+                # would keep running forever.
+                self._last_rumble = (0, 0)
+                self._state.on_rumble(0, 0)
+                if self._receiver is not None and self._pc_reachable:
+                    self._receiver.send_state(_build_rumble_packet(0, 0))
         if "tray.show_battery" in changed or "controller.battery_display_enabled" in changed:
             self._tray.set_show_battery(
                 self._config.get_bool("tray.show_battery") and

@@ -69,6 +69,16 @@ class ManagementServer:
                         return
                     if parsed.path == "/api/config":
                         owner._send(self, owner._update_config(body))
+                    elif parsed.path == "/api/rumble/test":
+                        try:
+                            left = max(0, min(255, int(body.get("left", 255))))
+                            right = max(0, min(255, int(body.get("right", 255))))
+                            duration = max(0.1, min(5.0, float(body.get("duration", 1.0))))
+                            result = owner._app.test_rumble(
+                                left=left, right=right, duration=duration)
+                            owner._send(self, {"ok": True, "rumble": result})
+                        except Exception as exc:
+                            owner._send(self, {"ok": False, "error": str(exc)})
                     elif parsed.path == "/api/restart":
                         owner._send(self, {"ok": True, "message": "restart requested"})
                         threading.Timer(0.2, owner._restart).start()
@@ -109,6 +119,8 @@ class ManagementServer:
             "controller": bool(self._app._device),
             "controller_path": getattr(self._app._device, "path", "") if self._app._device else "",
             "tcp_connected": bool(self._app._tcp and self._app._tcp.connected),
+            "rumble": (self._app._rumble.describe()
+                       if getattr(self._app, "_rumble", None) else {}),
             "config": {key: os.getenv(key, "") for key in sorted(_ALLOWED)},
             "log_path": os.getenv("LOG_FILE", "/config/xbox-bridge.log"),
             "state": {

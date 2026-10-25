@@ -33,8 +33,9 @@ Auto-discovery means you don't type IPs anywhere — Windows announces itself an
 
 - **Plug-and-play virtual Xbox 360 controller** — no game-side configuration
 - **Battery level** — Linux reads the controller's battery/charging status
-  over `EV_MSC` (or `ABS_MISC` as a fallback) and surfaces it on the
-  Windows dashboard and tray tooltip in real time
+  (from `ABS_MISC` when the firmware reports it, with a `bluetoothctl`
+  fallback) and surfaces it on the Windows dashboard and tray tooltip in
+  real time
 - **Vibration / rumble** — game rumble is forwarded from the Windows host
   back to the physical controller over the same TCP connection, so games
   that vibrate the virtual pad also vibrate the real one
@@ -116,10 +117,12 @@ Once both sides are installed, just:
 
 **Windows:** Right-click the tray icon → *Open Web UI* (or visit
 <http://127.0.0.1:<port>/> on the Windows PC, where *port* is shown by the
-tray's *Open Web UI* action or in `config.ini`). The local dashboard shows the
-connection state, controller name/MAC, battery % with bar, live rumble
-motors, peer IP, uptime, packet count, a live event feed, a filterable log
-viewer, and every setting. The tray tooltip also shows the battery %.
+tray's *Open Web UI* action or in `config.ini`). The local dashboard shows a
+live signal path (controller → Linux → network → virtual pad), stick,
+trigger and button telemetry, battery % with bar, live rumble motors with a
+**Test motors** action, peer IP, uptime, packet stats, a live event feed, a
+filterable log viewer, and every setting. The vibration and battery-display
+switches save immediately. The tray tooltip also shows the battery %.
 
 The tray menu is deliberately minimal: **Open Web UI · Reset · Reconnect ·
 Open App Folder · Exit**.
@@ -325,12 +328,38 @@ sender will appear with battery=unknown and rumble=0 on a v2 receiver.
 
 When a Windows game calls `XInputSetState`, ViGEmBus notifies the bridge.
 The new motor speeds are encoded as a v2 packet and sent back to the Linux
-side over the same TCP socket. The Linux side opens the controller's
-`/dev/hidraw*` node and writes a 13-byte Xbox One rumble output report
-to make the controller physically vibrate.
+side over the same TCP socket.
 
-`/dev/hidraw` is mounted into the Linux container by the bundled
-`docker-compose.yml` — no extra configuration needed.
+On the Linux side the bridge uses whichever backend the controller offers:
+
+* **Bluetooth controllers** use the kernel force-feedback interface: the
+  bridge uploads an `FF_RUMBLE` effect and plays it with `EV_FF`. A request
+  to stop uploads zero magnitudes and plays that zero effect, because a
+  plain `EV_FF` stop can leave the last nonzero report latched on
+  `ff-memless` controllers. A `/dev/hidraw*` node often exists for
+  Bluetooth too, but writing raw output reports through it is not reliable,
+  so FF is preferred.
+* **USB controllers** expose a `/dev/hidraw*` node; the bridge writes the
+  controller-specific rumble output report to it, with FF as a fallback.
+
+Both `/dev/input` and `/dev/hidraw` are mounted **read-write** by the
+bundled `docker-compose.yml` and the generated install compose file. A
+read-only `/dev/input` bind mount lets the effect upload succeed but makes
+vibration silently fail because the play event cannot be written.
+
+If vibration is silent after updating from an older install, re-run
+`linux/install.sh` (it regenerates the compose file) or change the mounts
+in your existing `docker-compose.yml` to:
+
+```yaml
+    volumes:
+      - /dev/input:/dev/input:rw
+      - /dev/hidraw:/dev/hidraw:rw
+```
+
+Then recreate the container with `docker compose up -d --force-recreate`.
+The dashboard's **Test motors** button is the quickest way to check the
+whole feedback path without launching a game.
 
 ### Latency
 
@@ -379,6 +408,33 @@ sudo hciconfig  # show adapters
 
 - Move the Linux server closer to the controller
 - Some USB Bluetooth adapters have limited range — a dedicated BT 5.0 adapter helps
+
+### Vibration does not work
+
+1. Open the dashboard. The Link card's **Feedback** row shows which backend
+   the Linux side attached (`Force feedback`, `Hidraw`, or `None`).
+2. Open **Linux container**. The Container status card shows the backend,
+   device and state, plus a **Test on Linux** button. That button pulses the
+   controller directly, bypassing Windows, TCP and the game.
+3. Press **Test motors** on the dashboard to test the full path. A pulse means
+   Windows → TCP → Linux → controller is working; silence means the problem
+   is before the controller. If a game leaves the motors running, press
+   **Stop** next to it.
+4. Check the Linux log for:
+   - `Rumble backend: force feedback on /dev/input/eventN` — the correct
+     backend for Bluetooth controllers.
+   - `Rumble from PC: left=... right=...` — the Linux side received the
+     Windows rumble packet.
+   - `Rumble self-test: left=... right=...` — the Linux-side test ran.
+   - `Could not write EV_FF` or `no write access to device` — the container
+     is still mounting `/dev/input` read-only. Use the read-write mounts shown
+     in [Reverse channel — game rumble](#reverse-channel--game-rumble) and
+     recreate the container with
+     `docker compose up -d --force-recreate`.
+5. USB controllers need `/dev/hidraw` read-write; Bluetooth controllers need
+   `/dev/input` read-write. Bluetooth controllers prefer the kernel
+   force-feedback backend even when a `/dev/hidraw*` node exists, because raw
+   reports through that node are not reliable on Bluetooth.
 
 ### The controller is connected but does not appear on the PC
 
@@ -549,7 +605,7 @@ bluetooth-bridge/
 │       ├── controller.py   # evdev → 54-byte v2 packets (battery, identity)
 │       ├── network.py      # TCP client
 │       ├── bluetooth.py   # bluetoothctl pairing
-│       ├── rumble.py      # hidraw rumble output reports
+│       ├── rumble.py      # hidraw + force-feedback rumble backends
 │       └── discovery.py    # UDP auto-discovery
 └── windows/
     ├── installer/

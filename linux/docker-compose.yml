@@ -11,8 +11,8 @@ services:
       - .:/config:rw
       - /var/run/dbus:/var/run/dbus:ro
       - /run/dbus:/run/dbus:ro
-      - /dev/input:/dev/input:ro
-      - /dev/hidraw:/dev/hidraw:ro
+      - /dev/input:/dev/input:rw
+      - /dev/hidraw:/dev/hidraw:rw
     environment:
       - PC_HOST=${PC_HOST:-auto}   # Use 'auto' for zero-config discovery, or set an IP manually
       - PC_PORT=${PC_PORT:-9999}

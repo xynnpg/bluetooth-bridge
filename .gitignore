@@ -1,6 +1,12 @@
 # Claude Code
 .claude/
 
+# Locally installed agent tooling and design-check output
+.opencode/
+.agents/
+.taste-skill/
+skills-lock.json
+
 # Python
 __pycache__/
 *.py[cod]

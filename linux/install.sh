@@ -172,14 +172,15 @@ services:
     # /dev/input and /dev/hidraw are mounted both as directory binds
     # (so any new device nodes created by udev after start are visible)
     # and as explicit device binds (so the controller's hidraw node is
-    # always present, even before the device shows up). Rumble will
-    # silently no-op if no node exists for the controller.
+    # always present, even before the device shows up). They must be
+    # writable: EV_FF rumble is played by writing to /dev/input/eventN.
+    # Rumble will silently no-op if no node exists for the controller.
     volumes:
       - .:/config:rw
       - /var/run/dbus:/var/run/dbus:ro
       - /run/dbus:/run/dbus:ro
-      - /dev/input:/dev/input:ro
-      - /dev/hidraw:/dev/hidraw:ro
+      - /dev/input:/dev/input:rw
+      - /dev/hidraw:/dev/hidraw:rw
     devices:
       - /dev/hidraw0:/dev/hidraw0:rwm
       - /dev/hidraw1:/dev/hidraw1:rwm
@@ -217,12 +218,24 @@ EOF
 
 success ".env written to $INSTALL_DIR/.env"
 
-# requirements.txt (extract from repo)
-info "Downloading requirements.txt …"
-curl -fsSL "$REPO_BASE/linux/requirements.txt" -o "$INSTALL_DIR/requirements.txt" 2>/dev/null || \
-    cat > "$INSTALL_DIR/requirements.txt" <<'REQ'
+# requirements.txt (prefer a local checkout when available)
+REPO_LOCAL=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _candidate="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+    if [[ -d "$_candidate/linux/src" ]]; then
+        REPO_LOCAL="$_candidate"
+    fi
+fi
+
+info "Preparing requirements.txt …"
+if [[ -n "$REPO_LOCAL" && -f "$REPO_LOCAL/linux/requirements.txt" ]]; then
+    cp "$REPO_LOCAL/linux/requirements.txt" "$INSTALL_DIR/requirements.txt"
+else
+    curl -fsSL "$REPO_BASE/linux/requirements.txt" -o "$INSTALL_DIR/requirements.txt" 2>/dev/null || \
+        cat > "$INSTALL_DIR/requirements.txt" <<'REQ'
 evdev>=1.7.1 ; sys_platform != 'win32'
 REQ
+fi
 
 # Copy source files
 info "Deploying source files …"
@@ -233,30 +246,13 @@ mkdir -p "$INSTALL_DIR/src"
 rm -rf "$INSTALL_DIR/src"
 mkdir -p "$INSTALL_DIR/src" "$INSTALL_DIR/tools"
 
-# Download source from GitHub
-TARBALL="https://github.com/xynnpg/bluetooth-bridge/archive/refs/heads/main.zip"
-TMPZIP=$(mktemp /tmp/bridge-src.XXXXX.zip)
-if curl -fsSL "$TARBALL" -o "$TMPZIP" 2>/dev/null; then
-    unzip -q "$TMPZIP" -d /tmp/
-    cp -r /tmp/bluetooth-bridge-main/linux/src/* "$INSTALL_DIR/src/"
-    # The diagnostic collector (merges the Linux and the Windows trace).
-    if [[ -d /tmp/bluetooth-bridge-main/tools ]]; then
-        cp -r /tmp/bluetooth-bridge-main/tools/* "$INSTALL_DIR/tools/"
-    fi
-    # The controller repair helper.
-    if [[ -f /tmp/bluetooth-bridge-main/linux/repair_controller.sh ]]; then
-        cp /tmp/bluetooth-bridge-main/linux/repair_controller.sh "$INSTALL_DIR/"
-        chmod +x "$INSTALL_DIR/repair_controller.sh"
-    fi
-    rm -rf /tmp/bluetooth-bridge-main
-fi
-rm -f "$TMPZIP"
-
-# If download failed, copy from the repo directory
-REPO_LOCAL="/home/xynnpg/Projects/bluetooth-bridge"
-if [[ -d "$REPO_LOCAL/linux/src" ]] && [[ ! -f "$INSTALL_DIR/src/main.py" ]]; then
-    warn "GitHub download failed — using local repo files."
+if [[ -n "$REPO_LOCAL" ]]; then
+    # Running from a checkout: deploy exactly these files.  Downloading
+    # `main` here would silently overwrite local fixes with an older
+    # release.
+    info "Using local checkout: $REPO_LOCAL"
     cp -r "$REPO_LOCAL/linux/src/"* "$INSTALL_DIR/src/"
+    cp "$REPO_LOCAL/linux/requirements.txt" "$INSTALL_DIR/requirements.txt"
     if [[ -d "$REPO_LOCAL/tools" ]]; then
         cp -r "$REPO_LOCAL/tools/"* "$INSTALL_DIR/tools/"
     fi
@@ -264,6 +260,30 @@ if [[ -d "$REPO_LOCAL/linux/src" ]] && [[ ! -f "$INSTALL_DIR/src/main.py" ]]; th
         cp "$REPO_LOCAL/linux/repair_controller.sh" "$INSTALL_DIR/"
         chmod +x "$INSTALL_DIR/repair_controller.sh"
     fi
+else
+    # curl | bash mode: fetch the released source tree.
+    info "Downloading source from GitHub …"
+    TARBALL="https://github.com/xynnpg/bluetooth-bridge/archive/refs/heads/main.zip"
+    TMPZIP=$(mktemp /tmp/bridge-src.XXXXX.zip)
+    if curl -fsSL "$TARBALL" -o "$TMPZIP" 2>/dev/null; then
+        unzip -q "$TMPZIP" -d /tmp/
+        cp -r /tmp/bluetooth-bridge-main/linux/src/* "$INSTALL_DIR/src/"
+        # The diagnostic collector (merges the Linux and the Windows trace).
+        if [[ -d /tmp/bluetooth-bridge-main/tools ]]; then
+            cp -r /tmp/bluetooth-bridge-main/tools/* "$INSTALL_DIR/tools/"
+        fi
+        # The controller repair helper.
+        if [[ -f /tmp/bluetooth-bridge-main/linux/repair_controller.sh ]]; then
+            cp /tmp/bluetooth-bridge-main/linux/repair_controller.sh "$INSTALL_DIR/"
+            chmod +x "$INSTALL_DIR/repair_controller.sh"
+        fi
+        rm -rf /tmp/bluetooth-bridge-main
+    else
+        err "Could not download the source tree. Re-run from a checkout or fix network access."
+        rm -f "$TMPZIP"
+        exit 1
+    fi
+    rm -f "$TMPZIP"
 fi
 
 # ── 5. Bluetooth check ────────────────────────────────────────────────────────

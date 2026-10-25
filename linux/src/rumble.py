@@ -20,14 +20,20 @@ interface and are selected automatically based on the device path:
   (model 1708+) or 13-byte (model 1697) output report.  The format is
   auto-detected from the device's PRODUCT id.
 * ``ForceFeedbackRumbleWriter`` — uploads a single indefinite
-  ``FF_RUMBLE`` effect and updates its ``strong_magnitude`` /
-  ``weak_magnitude`` on every ``apply()`` call.
+  ``FF_RUMBLE`` effect, writes an ``EV_FF`` *play* event when rumble
+  changes, and sends a zero-magnitude effect when rumble returns to zero.
+  A plain ``EV_FF`` stop is not enough on every driver: ff-memless can
+  stop combining without emitting a final zero report, leaving the last
+  nonzero command latched on the controller.
 
 Public entry points:
 
 * :func:`find_hidraw_for` / :func:`find_hidraw_by_mac` — locate a
   hidraw node for the controller (USB-style).  Returns ``None`` for
   pure-Bluetooth controllers that have no hidraw sibling.
+* :func:`find_force_feedback_for` — locate an event node for the
+  controller that exposes ``FF_RUMBLE`` (the node used for input is not
+  always the FF node).
 * :func:`is_force_feedback_available` — check whether a given
   ``/dev/input/eventN`` device exposes ``FF_RUMBLE``.
 * :class:`RumbleWriter` — facade.  ``set_device(path)`` dispatches to
@@ -42,11 +48,18 @@ import logging
 import os
 import re
 import struct
+import time
 from typing import Optional
 
 import evdev
 
 logger = logging.getLogger("rumble")
+
+# python-evdev raises EvdevError (not OSError) when the device was opened
+# read-only and a write is attempted.  Older releases may not expose the
+# class, hence the getattr fallback.
+_EVDEV_WRITE_ERRORS = (OSError, AttributeError,
+                       getattr(evdev, "EvdevError", OSError))
 
 # --- Xbox Wireless (model 1708, 1797, 1914) — 9-byte output report ----------
 # Layout from drivers/hid/hid-microsoft.c:
@@ -145,7 +158,7 @@ def _list_dir(path: str) -> list[str]:
 def _resolve_hidraw(name: str) -> str | None:
     devnode = f"/dev/{name}"
     if os.path.exists(devnode):
-        logger.info("Found hidraw node: %s", devnode)
+        logger.debug("Found hidraw node: %s", devnode)
         return devnode
     return None
 
@@ -172,6 +185,65 @@ def find_hidraw_by_mac(mac: str) -> str | None:
     return None
 
 
+def _has_ff_rumble(dev: evdev.InputDevice) -> bool:
+    """Return True if *dev* exposes ``FF_RUMBLE``."""
+    try:
+        ff_types = dev.capabilities(absinfo=False).get(
+            evdev.ecodes.EV_FF, []
+        )
+    except OSError:
+        return False
+    codes = {c[0] if isinstance(c, tuple) else c for c in ff_types}
+    return evdev.ecodes.FF_RUMBLE in codes
+
+
+def find_force_feedback_for(device: evdev.InputDevice) -> str | None:
+    """Find an event node for *device* that exposes ``FF_RUMBLE``.
+
+    The node used for reading gameplay input is usually also the FF node,
+    but that is not guaranteed: a controller can expose several event
+    nodes (gamepad, media keys, touchpad) and the kernel attaches the
+    force-feedback capability to only one of them.  Checking just
+    ``device.path`` made rumble fail on such setups.
+
+    Returns the selected device's path when it has FF_RUMBLE, otherwise
+    the first sibling with the same name, phys or uniq (MAC) that does.
+    """
+    if _has_ff_rumble(device):
+        return device.path
+
+    target_name = (getattr(device, "name", "") or "").lower()
+    target_phys = (getattr(device, "phys", "") or "").lower()
+    target_uniq = (getattr(device, "uniq", "") or "").lower()
+
+    for path in evdev.list_devices():
+        if path == device.path:
+            continue
+        try:
+            candidate = evdev.InputDevice(path)
+        except (FileNotFoundError, OSError, PermissionError):
+            continue
+        try:
+            name = (candidate.name or "").lower()
+            phys = (candidate.phys or "").lower()
+            uniq = (candidate.uniq or "").lower()
+            same_controller = (
+                (target_name and name == target_name)
+                or (target_phys and phys == target_phys)
+                or (target_uniq and uniq == target_uniq)
+                or any(k in name for k in ("xbox", "microsoft", "controller"))
+            )
+            if same_controller and _has_ff_rumble(candidate):
+                logger.info("FF rumble device: %s (%s)", path, candidate.name)
+                return path
+        finally:
+            try:
+                candidate.close()
+            except Exception:
+                pass
+    return None
+
+
 def is_force_feedback_available(evdev_path: str) -> bool:
     """Return True if the input device at *evdev_path* exposes ``FF_RUMBLE``.
 
@@ -187,11 +259,7 @@ def is_force_feedback_available(evdev_path: str) -> bool:
                      evdev_path, exc)
         return False
     try:
-        ff_types = dev.capabilities(absinfo=False).get(evdev.ecodes.EV_FF, [])
-        # `ff_types` is a list of (code, AbsInfo) tuples or just codes
-        # depending on evdev version.  Normalise to a set of ints.
-        codes = {c[0] if isinstance(c, tuple) else c for c in ff_types}
-        return evdev.ecodes.FF_RUMBLE in codes
+        return _has_ff_rumble(dev)
     except OSError as exc:
         logger.debug("is_force_feedback_available: capabilities() failed: %s", exc)
         return False
@@ -213,6 +281,7 @@ class HidrawRumbleWriter:
         self._path: str | None = None
         self._fd: int | None = None
         self._last = (-1, -1)
+        self._last_error = ""
         # 'wireless' = 9-byte report (0x03, model 1708+); 'one' = 13-byte
         # legacy (0x09, model 1697 / original Xbox One).
         self._format: str = "wireless"
@@ -287,9 +356,11 @@ class HidrawRumbleWriter:
             # until the first report is sent after reconnect)
             os.write(self._fd, self._init_pkt)
             self._last = (0, 0)
+            self._last_error = ""
             logger.info("HidrawRumbleWriter attached to %s", self._path)
             return True
         except OSError as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
             logger.warning("Could not open %s for rumble: %s", self._path, exc)
             self._fd = None
             return False
@@ -318,7 +389,9 @@ class HidrawRumbleWriter:
             )
         try:
             os.write(self._fd, report)
+            self._last_error = ""
         except OSError as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
             logger.debug("Rumble write failed: %s", exc)
             try:
                 os.close(self._fd)
@@ -352,18 +425,24 @@ class ForceFeedbackRumbleWriter:
     exposes the device as ``/dev/input/eventN`` with an ``EV_FF`` capability
     of ``FF_RUMBLE`` but **no** sibling ``/dev/hidrawN`` node.  In that
     case rumble is sent by uploading a single indefinite
-    ``FF_RUMBLE`` effect and updating its ``strong_magnitude`` /
-    ``weak_magnitude`` on every change.
+    ``FF_RUMBLE`` effect, then writing an ``EV_FF`` event to start it.
+    Updating the magnitudes while it runs updates the effect in place.
+    A zero request uploads zero magnitudes and plays that effect so the
+    driver emits a zero output report; writing ``EV_FF`` value ``0`` alone
+    is not reliable for ff-memless controllers.
+
+    Uploading an effect does **not** play it.  Linux's force-feedback API
+    requires a separate ``write()`` of an ``EV_FF`` event whose code is the
+    effect id (value = repeat count) — omitting it is why an otherwise
+    valid FF rumble path stays silent.
 
     The effect is created with ``replay.length = 0`` (= "play until
-    stopped / re-uploaded") and ``replay.delay = 0``.  Re-uploading with
-    the same effect id updates the magnitudes in-place without needing
-    a separate play/stop sequence.
+    stopped") and ``replay.delay = 0``.
     """
 
-    # Force-feedback magnitude range is 0..0xFFFF (16-bit).  We map our
-    # 0..255 input range onto 0..0xFFFF, leaving the top quarter of
-    # the range as headroom — most FF devices saturate before then.
+    # Force-feedback magnitude range is 0..0xFFFF (16-bit).  Map our
+    # 0..255 input range onto the full range; the driver scales it down
+    # to the controller's own 0..100 motor range.
     _MAX_FF = 0xFFFF
 
     def __init__(self) -> None:
@@ -374,6 +453,14 @@ class ForceFeedbackRumbleWriter:
         # (kernel interprets re-upload of an existing id as an update).
         self._effect: evdev.ff.Effect | None = None
         self._effect_id: int | None = None
+        # True while the effect has been started with an EV_FF event.
+        # Uploading alone does not play an effect; it has to be started.
+        self._playing = False
+        # Avoid spamming the log if the fd is read-only (the common
+        # container-mount failure mode).
+        self._ff_write_error_logged = False
+        # Last human-readable error, shown by the Linux diagnostics API.
+        self._last_error = ""
 
     def set_device(self, evdev_path: str) -> bool:
         """Open the input device and prepare a permanent FF_RUMBLE effect.
@@ -388,9 +475,12 @@ class ForceFeedbackRumbleWriter:
         return self._open()
 
     def _open(self) -> bool:
+        self._playing = False
+        self._ff_write_error_logged = False
         try:
             self._dev = evdev.InputDevice(self._path)
         except (FileNotFoundError, OSError) as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
             logger.warning("Could not open %s for FF rumble: %s",
                            self._path, exc)
             self._dev = None
@@ -405,12 +495,14 @@ class ForceFeedbackRumbleWriter:
             )
             codes = {c[0] if isinstance(c, tuple) else c for c in ff_types}
         except OSError as exc:
+            self._last_error = f"capabilities: {type(exc).__name__}: {exc}"
             logger.warning("FF capability query failed: %s", exc)
             self._dev.close()
             self._dev = None
             return False
 
         if evdev.ecodes.FF_RUMBLE not in codes:
+            self._last_error = "device has no FF_RUMBLE capability"
             logger.info("Device %s has no FF_RUMBLE capability", self._path)
             self._dev.close()
             self._dev = None
@@ -435,26 +527,73 @@ class ForceFeedbackRumbleWriter:
         try:
             self._effect_id = self._dev.upload_effect(self._effect)
             self._last = (0, 0)
+            self._last_error = ""
             logger.info(
                 "ForceFeedbackRumbleWriter attached to %s (effect id %d)",
                 self._path, self._effect_id,
             )
             return True
         except OSError as exc:
-            logger.warning("Failed to upload FF_RUMBLE effect: %s", exc)
+            self._last_error = f"upload: {type(exc).__name__}: {exc}"
+            logger.warning(
+                "Failed to upload FF_RUMBLE effect: %s — check that "
+                "/dev/input is mounted read-write in the container", exc)
             self._effect = None
             self._effect_id = None
             self._dev.close()
             self._dev = None
             return False
 
-    def apply(self, left: int, right: int) -> None:
-        """Update the FF_RUMBLE effect's strong/weak magnitudes.
+    def _write_ff(self, value: int) -> bool:
+        """Write an ``EV_FF`` event for the cached effect.
 
-        Re-uploading the effect with the same id updates it in-place.
-        Most kernels will keep the effect playing across updates, but a
-        few require the effect to be erased+re-uploaded; in that case
-        we fall back to a clean re-upload.
+        ``value`` is the repeat count: a positive value starts the effect,
+        ``0`` stops it.  Returns True when the kernel accepted the event.
+        """
+        if self._dev is None or self._effect_id is None:
+            return False
+        try:
+            self._dev.write(evdev.ecodes.EV_FF, self._effect_id, value)
+            self._last_error = ""
+            return True
+        except _EVDEV_WRITE_ERRORS as exc:
+            self._last_error = f"EV_FF: {type(exc).__name__}: {exc}"
+            if not self._ff_write_error_logged:
+                # This is the classic symptom of a read-only /dev/input
+                # bind mount: uploading succeeds, playing does not.
+                logger.warning(
+                    "Could not write EV_FF to %s: %s — check that "
+                    "/dev/input is mounted read-write in the container",
+                    self._path, exc,
+                )
+                self._ff_write_error_logged = True
+            else:
+                logger.debug("EV_FF write failed: %s", exc)
+            return False
+
+    def _start(self) -> None:
+        """Start (or restart) the effect via ``EV_FF``."""
+        if self._playing:
+            # Re-starting is harmless and makes updates visible on
+            # drivers that reset a playing effect on re-upload.
+            self._write_ff(1)
+            return
+        if self._write_ff(1):
+            self._playing = True
+            logger.debug("FF rumble started (effect %s)", self._effect_id)
+
+    def apply(self, left: int, right: int) -> None:
+        """Update the FF_RUMBLE effect and start/stop playback.
+
+        Re-uploading an effect with the same id updates its parameters.
+        Playback is controlled separately with ``EV_FF`` events: upload
+        alone never produces vibration.
+
+        A zero request is handled by uploading zero magnitudes and playing
+        that effect.  Writing ``EV_FF`` zero directly is not reliable for
+        all kernel backends: ff-memless clears the effect and stops
+        combining, but does not necessarily emit a final zero report, so
+        the last nonzero command can stay latched on the controller.
         """
         left  = max(0, min(255, int(left)))
         right = max(0, min(255, int(right)))
@@ -475,13 +614,17 @@ class ForceFeedbackRumbleWriter:
         try:
             self._dev.upload_effect(self._effect)
         except OSError as exc:
+            self._last_error = f"update: {type(exc).__name__}: {exc}"
             logger.debug("FF_RUMBLE update failed: %s", exc)
             # Effect may have been lost (controller reset etc.) —
             # try a clean re-upload once.
             try:
                 self._effect.id = -1
                 self._effect_id = self._dev.upload_effect(self._effect)
+                self._playing = False
+                self._last_error = ""
             except OSError as exc2:
+                self._last_error = f"re-upload: {type(exc2).__name__}: {exc2}"
                 logger.debug("FF_RUMBLE re-upload failed: %s", exc2)
                 # Give up; the next set_device() will try fresh.
                 try:
@@ -490,9 +633,29 @@ class ForceFeedbackRumbleWriter:
                     pass
                 self._dev = None
                 self._effect_id = None
+                self._playing = False
+                return
+
+        # Play even for (0, 0): this forces the driver to emit a zero
+        # output report before the effect is stopped or erased.
+        self._start()
 
     def close(self) -> None:
         """Stop the FF effect and release the input device."""
+        if (self._playing and self._dev is not None
+                and self._effect is not None and self._effect_id is not None):
+            # Force a zero-magnitude output before erasing.  See apply().
+            self._effect.u.ff_rumble_effect.strong_magnitude = 0
+            self._effect.u.ff_rumble_effect.weak_magnitude = 0
+            self._effect.id = self._effect_id
+            try:
+                self._dev.upload_effect(self._effect)
+                self._dev.write(evdev.ecodes.EV_FF, self._effect_id, 1)
+                # Let the driver's workqueue send the zero report before
+                # the effect is removed.
+                time.sleep(0.03)
+            except Exception:
+                pass
         if self._dev is not None and self._effect_id is not None:
             try:
                 self._dev.erase_effect(self._effect_id)
@@ -508,6 +671,8 @@ class ForceFeedbackRumbleWriter:
         self._dev = None
         self._effect = None
         self._effect_id = None
+        self._playing = False
+        self._last_error = ""
         self._last = (-1, -1)
 
 
@@ -575,6 +740,40 @@ class RumbleWriter:
             return
         self._last = (left, right)
         self._active.apply(left, right)  # type: ignore[attr-defined]
+
+    @property
+    def available(self) -> bool:
+        """True when a backend is attached and ready for ``apply()``."""
+        return self._active is not None
+
+    def describe(self) -> dict:
+        """Return a small serialisable status snapshot for diagnostics."""
+        active = self._active
+        if active is None:
+            return {
+                "backend": "none",
+                "path": "",
+                "playing": False,
+                "last": list(self._last),
+                "error": "no rumble backend attached",
+            }
+        if isinstance(active, ForceFeedbackRumbleWriter):
+            backend = "force feedback"
+        elif isinstance(active, HidrawRumbleWriter):
+            backend = "hidraw"
+        else:
+            backend = type(active).__name__
+        return {
+            "backend": backend,
+            "path": getattr(active, "_path", "") or "",
+            # The effect stays "started" at zero by design (that is how the
+            # driver emits the zero report).  "playing" in diagnostics means
+            # the motors are actually being driven.
+            "playing": bool(getattr(active, "_playing", False))
+                       and any(self._last),
+            "last": list(self._last),
+            "error": getattr(active, "_last_error", "") or "",
+        }
 
     def close(self) -> None:
         """Stop rumble and release all backends."""
